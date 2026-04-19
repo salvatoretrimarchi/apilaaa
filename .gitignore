@@ -1,0 +1,35 @@
+# Rust
+target/
+Cargo.lock
+
+# Input data (camera RAW)
+res/*
+res_old/
+res_clean/
+*.ARW
+*.arw
+*.CR2
+*.CR3
+*.NEF
+*.RAF
+*.ORF
+
+# Image outputs
+*.tif
+*.tiff
+*.dng
+*.png
+!comparaciones/*.png
+
+# Development sidecars (the ones in comparaciones/ are versioned)
+/*.xmp
+
+# Benchmarks and profiling
+.bench/
+
+# Logs
+*.log
+
+# System junk
+.Trash-*/
+.DS_Store

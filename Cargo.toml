@@ -1,0 +1,16 @@
+[package]
+name = "apilaaa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rawloader = "0.37"
+tiff = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
