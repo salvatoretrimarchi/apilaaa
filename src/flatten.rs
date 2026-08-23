@@ -911,7 +911,7 @@ fn fit_residual_surface(map: &BgMap, model: &GlareModel, step_cells: usize, lamb
         }
     }
     let ok = |i: usize| map.is_valid(i);
-    fit_surface_core(map.gw, map.gh, map.block, &resid, &ok, step_cells, lambda, false, None, true).0
+    fit_surface_core(map.gw, map.gh, map.block, &resid, &ok, step_cells, lambda, false, None, None, true).0
 }
 
 /// Core of the smooth bilinear surface fit to a per-cell residual. `ok`
@@ -930,8 +930,9 @@ fn fit_surface_core(
     lambda: f64,
     symmetric: bool,
     extra: Option<&[[f32; 3]]>,
+    extra2: Option<&[[f32; 3]]>,
     robust: bool,
-) -> (Surface, [f32; 3]) {
+) -> (Surface, [f32; 3], [f32; 3]) {
     let step = (step_cells * block) as f32;
     let nx = gw / step_cells + 2;
     let ny = gh / step_cells + 2;
@@ -961,19 +962,23 @@ fn fit_surface_core(
     // (Aᵀ W A + λ Lᵀ L + ε I) s = Aᵀ W r. Every cell touches 4 nodes; L is
     // the second difference in x and y between nodes.
     let lambda_smooth = lambda;
-    // Unknowns: nn nodes (+1 coefficient for `extra`, index nn).
-    let nu = nn + 1;
-    let matvec = |v: &[f64], out: &mut [f64], weight: &[bool], ex: &[f64]| {
+    // Unknowns: nn nodes, plus one amplitude per extra basis (indices nn
+    // and nn+1). The bases are fixed spatial shapes with a free scalar, so
+    // they can only rescale a known pattern, never invent structure.
+    let nu = nn + 2;
+    let matvec = |v: &[f64], out: &mut [f64], weight: &[bool], ex: &[f64], ex2: &[f64]| {
         for o in out.iter_mut() { *o = 0.0; }
         for i in 0..n {
             if !weight[i] { continue; }
             let (ids, vs) = &basis[i];
-            let mut sv = v[nn] * ex[i];
+            let mut sv = v[nn] * ex[i] + v[nn + 1] * ex2[i];
             for a in 0..4 { sv += v[ids[a]] * vs[a]; }
             for a in 0..4 { out[ids[a]] += vs[a] * sv; }
             out[nn] += ex[i] * sv;
+            out[nn + 1] += ex2[i] * sv;
         }
         out[nn] += 1e-9 * v[nn];
+        out[nn + 1] += 1e-9 * v[nn + 1];
         for j in 0..ny {
             for i in 0..nx {
                 let k = j * nx + i;
@@ -996,10 +1001,12 @@ fn fit_surface_core(
     let mut data = vec![0.0f32; nn * 3];
     let mut range = [0.0f32; 3];
     let mut coef = [0.0f32; 3];
-    let per_channel: Vec<(Vec<f32>, f32, f32)> = (0..3)
+    let mut coef2 = [0.0f32; 3];
+    let per_channel: Vec<(Vec<f32>, f32, f32, f32)> = (0..3)
         .into_par_iter()
         .map(|c| {
             let ex: Vec<f64> = (0..n).map(|i| extra.map_or(0.0, |e| e[i][c] as f64)).collect();
+            let ex2: Vec<f64> = (0..n).map(|i| extra2.map_or(0.0, |e| e[i][c] as f64)).collect();
             let mut weight: Vec<bool> = (0..n).map(|i| ok(i)).collect();
             let mut sol = vec![0.0f64; nu];
             let mut rhs = vec![0.0f64; nu];
@@ -1013,15 +1020,16 @@ fn fit_surface_core(
                     let y = resid[i][c] as f64;
                     for a in 0..4 { rhs[ids[a]] += vs[a] * y; }
                     rhs[nn] += ex[i] * y;
+                    rhs[nn + 1] += ex2[i] * y;
                 }
                 // CG starting from the previous solution.
-                matvec(&sol, &mut ap, &weight, &ex);
+                matvec(&sol, &mut ap, &weight, &ex, &ex2);
                 for k in 0..nu { rv[k] = rhs[k] - ap[k]; pv[k] = rv[k]; }
                 let mut rr: f64 = rv.iter().map(|x| x * x).sum();
                 let rr0 = rr.max(1e-30);
                 for _ in 0..SURF_CG_ITERS {
                     if rr / rr0 < 1e-12 { break; }
-                    matvec(&pv, &mut ap, &weight, &ex);
+                    matvec(&pv, &mut ap, &weight, &ex, &ex2);
                     let pap: f64 = pv.iter().zip(&ap).map(|(a, b)| a * b).sum();
                     if pap <= 0.0 { break; }
                     let alpha = rr / pap;
@@ -1035,7 +1043,7 @@ fn fit_surface_core(
                 let mut res = vec![0.0f32; n];
                 for i in 0..n {
                     let (ids, vs) = &basis[i];
-                    let mut sv = sol[nn] * ex[i];
+                    let mut sv = sol[nn] * ex[i] + sol[nn + 1] * ex2[i];
                     for a in 0..4 { sv += sol[ids[a]] * vs[a]; }
                     res[i] = resid[i][c] - sv as f32;
                 }
@@ -1055,15 +1063,16 @@ fn fit_surface_core(
             let sol_f: Vec<f32> = sol[..nn].iter().map(|&v| v as f32).collect();
             let mn = sol_f.iter().cloned().fold(f32::MAX, f32::min);
             let mx = sol_f.iter().cloned().fold(f32::MIN, f32::max);
-            (sol_f, mx - mn, sol[nn] as f32)
+            (sol_f, mx - mn, sol[nn] as f32, sol[nn + 1] as f32)
         })
         .collect();
-    for (c, (sol, rg, cf)) in per_channel.into_iter().enumerate() {
+    for (c, (sol, rg, cf, cf2)) in per_channel.into_iter().enumerate() {
         for k in 0..nn { data[k * 3 + c] = sol[k]; }
         range[c] = rg;
         coef[c] = cf;
+        coef2[c] = cf2;
     }
-    (Surface { nx, ny, step, data, range }, coef)
+    (Surface { nx, ny, step, data, range }, coef, coef2)
 }
 
 struct Fit {
@@ -1339,6 +1348,8 @@ impl GlareModel {
         let h = height as f32;
 
         let mut best = (w * 0.5, h * 0.5, f32::INFINITY);
+        let (lo_x, hi_x) = (w * 0.25, w * 0.75);
+        let (lo_y, hi_y) = (h * 0.25, h * 0.75);
         let mut half_x = w * 0.25;
         let mut half_y = h * 0.25;
         let mut steps = 5i32;
@@ -1348,8 +1359,8 @@ impl GlareModel {
                 .flat_map(|iy| {
                     (-steps..=steps).map(move |ix| {
                         (
-                            bx + ix as f32 * half_x / steps as f32,
-                            by + iy as f32 * half_y / steps as f32,
+                            (bx + ix as f32 * half_x / steps as f32).clamp(lo_x, hi_x),
+                            (by + iy as f32 * half_y / steps as f32).clamp(lo_y, hi_y),
                         )
                     })
                 })
@@ -1623,7 +1634,14 @@ pub fn clean_frame(model: &GlareModel, frame: &Frame, extra: Option<&FrameCorr>,
                     let t = ((rn - FRAME_GAIN_R0) / (FRAME_GAIN_R1 - FRAME_GAIN_R0)).clamp(0.0, 1.0);
                     let wg = t * t * (3.0 - 2.0 * t);
                     for c in 0..3 {
-                        k[c] = k[c] + (e.gain[c] - 1.0) * (k[c] - lp[c]) * wg + sv[c] - e.pedestal[c];
+                        // Fine structure scaled by `gain`, smooth dome by
+                        // `dome` (about its own mean, so the level does not
+                        // move), then the anomaly surface and the pedestal.
+                        k[c] = k[c]
+                            + (e.gain[c] - 1.0) * (k[c] - lp[c]) * wg
+                            + (e.dome[c] - 1.0) * (k[c] - e.k_mean[c])
+                            + sv[c]
+                            - e.pedestal[c];
                     }
                 }
                 for c in 0..3 {
@@ -1665,9 +1683,26 @@ pub struct FrameCorr {
     /// Smooth component of the model correction (moving average over
     /// `FRAME_SURF_STEP_CELLS` cells), on the cell grid.
     pub k_lp: Surface,
+    /// Per-channel amplitude of that smooth component for this frame,
+    /// fitted alongside the surface. Vignetting is multiplicative on the
+    /// sky level while the model is additive and fitted at the session
+    /// median, so a frame at r× that level needs r× the dome; leaving it at
+    /// 1 is what left a bright dome on the bright frames and a dark hole on
+    /// the dark ones. Expected to land near `level_ratio`.
+    pub dome: [f32; 3],
+    /// Mean of the model correction over the frame's sky cells: the dome
+    /// amplitude acts on `k − k_mean`, so rescaling it does not move the
+    /// overall level.
+    pub k_mean: [f32; 3],
     /// Frame sky level / session median level.
     pub level_ratio: f32,
 }
+
+/// Bounds on the per-frame dome amplitude. A sky level ratio outside this
+/// range would mean a frame that is not part of the same session, so these
+/// only catch an ill-conditioned fit.
+const DOME_GAIN_MIN: f32 = 0.3;
+const DOME_GAIN_MAX: f32 = 3.0;
 
 /// Radii (in r_full) of the gain ramp (0 in the core → 1 outside).
 const FRAME_GAIN_R0: f32 = 0.20;
@@ -1767,6 +1802,10 @@ pub fn fit_frame_corr_ex(
             range: [0.0; 3],
             gain: [1.0; 3],
             k_lp: flat([0.0; 3]),
+            // `None` means the deep-night model exactly as fitted, so the
+            // dome keeps its session amplitude here too.
+            dome: [1.0; 3],
+            k_mean: [0.0; 3],
             level_ratio,
         };
     }
@@ -1822,6 +1861,34 @@ pub fn fit_frame_corr_ex(
             }
         }
     }
+    // Vignetting is multiplicative on the sky level, but the model is
+    // additive and was fitted at the session median. A frame whose sky sits
+    // at r× that level therefore keeps (r−1)× the model's smooth dome, with
+    // the sign flipping either side of the median: a bright dome early in
+    // the night, a dark hole late. The per-frame surface cannot absorb it
+    // (under `Coarse` it is deliberately stiff, so it only manages a tilt),
+    // so the dome's own shape is handed to the fit as a basis with a single
+    // free amplitude. One scalar over a fixed radial shape can rescale a
+    // known pattern but cannot represent a diagonal band, so this cancels
+    // the multiplicative error without touching the Milky Way.
+    // The basis is the model correction itself, centred on its own mean over
+    // the sky, not the moving average `k_lp`: that average spans
+    // `surf_step_cells` cells, which under `Coarse` is a 2048 px box, and
+    // flattens the very dome the amplitude is meant to rescale.
+    let mut k_mean = [0.0f32; 3];
+    {
+        let mut cnt = 0.0f32;
+        for i in 0..n {
+            if !sky(i) { continue; }
+            cnt += 1.0;
+            for c in 0..3 { k_mean[c] += kk[i][c]; }
+        }
+        if cnt > 0.0 { for c in 0..3 { k_mean[c] /= cnt; } }
+    }
+    let mut k_dome = vec![[0.0f32; 3]; n];
+    for i in 0..n {
+        for c in 0..3 { k_dome[i][c] = kk[i][c] - k_mean[c]; }
+    }
     let k_lp = Surface { nx: gw, ny: gh, step: map.block as f32, data: k_lp_data, range: [0.0; 3] };
     // In strong twilight/dawn (> FRAME_BRIGHT_RATIO) the anomaly is a huge
     // gradient (sky lit from the horizon, ×2–3): the robust fit would
@@ -1829,13 +1896,13 @@ pub fn fit_frame_corr_ex(
     // squares surface without rejection, more flexible, and gain 1 (the
     // deep-night model only).
     let bright = level_ratio > FRAME_BRIGHT_RATIO;
-    let (surface, coef) = if bright {
+    let (surface, coef, coef_dome) = if bright {
         fit_surface_core(
-            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda * BRIGHT_LAMBDA_RATIO, true, None, false,
+            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda * BRIGHT_LAMBDA_RATIO, true, None, Some(&k_dome), false,
         )
     } else {
         fit_surface_core(
-            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, Some(&k_fine), true,
+            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, Some(&k_fine), Some(&k_dome), true,
         )
     };
     let mut gain = [1.0f32; 3];
@@ -1845,6 +1912,12 @@ pub fn fit_frame_corr_ex(
     if !bright {
         for c in 0..3 { gain[c] = (1.0 + coef[c]).clamp(1.0, 3.0); }
     }
+    // Amplitude of the model's smooth dome for this frame. The physical
+    // expectation is `level_ratio` (vignetting scales with the sky level);
+    // the bounds only stop an ill-conditioned fit from running away, they
+    // are far outside the range a real sky level ratio reaches.
+    let mut dome = [1.0f32; 3];
+    for c in 0..3 { dome[c] = (1.0 + coef_dome[c]).clamp(DOME_GAIN_MIN, DOME_GAIN_MAX); }
     let mut pedestal = [0.0f32; 3];
     let mut range = [0.0f32; 3];
     let mut vals: Vec<[f32; 3]> = Vec::with_capacity(n);
@@ -1869,7 +1942,7 @@ pub fn fit_frame_corr_ex(
             if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
         };
         // Variant without gain (as before) for comparison.
-        let (surf_old, _) = fit_surface_core(gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, None, true);
+        let (surf_old, _, _) = fit_surface_core(gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, None, None, true);
         let ped_old = {
             let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| { let (x, y) = map.cell_center(i % gw, i / gw); surf_old.eval(x, y)[1] }).collect();
             if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
@@ -1903,7 +1976,7 @@ pub fn fit_frame_corr_ex(
         }
         print!("{out}");
     }
-    FrameCorr { surface, pedestal, range, gain, k_lp, level_ratio }
+    FrameCorr { surface, pedestal, range, gain, k_lp, dome, k_mean, level_ratio }
 }
 
 

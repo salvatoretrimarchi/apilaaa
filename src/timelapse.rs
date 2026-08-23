@@ -699,7 +699,7 @@ pub fn export_sequence(
                         });
                         pm
                     };
-                    let mut gain_txt = format!("  defects ×{:.2}/{:.2}/{:.2}  anomaly {:.1}%", fc.gain[0], fc.gain[1], fc.gain[2], 100.0 * fc.range[1] / reference.med[1].max(1e-9));
+                    let mut gain_txt = format!("  defects ×{:.2}/{:.2}/{:.2}  dome ×{:.2}/{:.2}/{:.2} (lv {:.2})  anomaly {:.1}%", fc.gain[0], fc.gain[1], fc.gain[2], fc.dome[0], fc.dome[1], fc.dome[2], fc.level_ratio, 100.0 * fc.range[1] / reference.med[1].max(1e-9));
                     // The normalized clean version is always produced (it is
                     // the one that enters the temporal window of every
                     // frame); the natural one is blended after combining.
