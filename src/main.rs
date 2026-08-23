@@ -1,4 +1,5 @@
 mod align;
+mod exif;
 mod fixed;
 mod flatten;
 mod output;
@@ -71,7 +72,10 @@ struct Args {
     /// the stack's, foreground excluded) and temporal noise reduction
     /// (sliding window, trimmed mean; the foreground —trees, horizon— is
     /// kept as is, without smearing it with the neighbouring frames). Same
-    /// stretch as the stack. Requires the correction to be enabled.
+    /// stretch as the stack — except under --fixed-tripod, where the stack
+    /// is a star-trail image and both the levels reference and the stretch
+    /// are taken from a representative frame instead. Requires the
+    /// correction to be enabled.
     #[arg(long, value_name = "DIR")]
     export_clean: Option<PathBuf>,
 
@@ -838,24 +842,47 @@ fn main() -> Result<()> {
     output::write_dng(&args.output, &out, out_w, out_h, &camera_model, stretch)?;
     println!("DNG written: {}", args.output.display());
 
+    // Photographic metadata of the source RAW, written natively into every
+    // DNG we produce: camera, lens, focal length, aperture, exposure, ISO
+    // and capture time. That is what a developer matches a lens profile on,
+    // and unlike `copy_metadata` below it needs no external tool. exiftool,
+    // when installed, then adds MakerNotes, XMP and ICC on top.
+    let src_exif = match exif::read_source(&paths[0]) {
+        Ok(e) => {
+            println!("EXIF from the source: {}", e.describe());
+            Some(e)
+        }
+        Err(e) => {
+            println!("WARNING: could not read the source EXIF: {e:#}");
+            None
+        }
+    };
+    if let Some(e) = &src_exif {
+        exif::embed(&args.output, e)
+            .with_context(|| format!("writing EXIF into {}", args.output.display()))?;
+    }
+
     if let Some(path) = &args.dump_correction {
         match (&corr, &stack_model) {
             (Some(grid), Some((_, m))) => {
                 let (x0, y0, _, _) = acc.valid_bounds();
                 let layer = flatten::correction_layer(grid, m.pedestal, x0, y0, out_w, out_h);
                 output::write_dng_quiet(path, &layer, out_w, out_h, &camera_model, stretch)?;
+                if let Some(e) = &src_exif {
+                    exif::embed(path, e)?;
+                }
                 println!("removed layer written: {}", path.display());
             }
             _ => println!("WARNING: --dump-correction ignored (correction disabled)"),
         }
     }
 
-    print!("copying EXIF + MakerNotes from {}... ", paths[0].file_name().unwrap().to_string_lossy());
+    print!("copying MakerNotes + XMP + ICC from {}... ", paths[0].file_name().unwrap().to_string_lossy());
     use std::io::Write;
     std::io::stdout().flush().ok();
     match output::copy_metadata(&paths[0], &args.output) {
         Ok(()) => println!("ok"),
-        Err(e) => println!("WARNING: {e:#} — valid DNG but without EXIF"),
+        Err(e) => println!("WARNING: {e:#} — the DNG keeps the EXIF written natively, without MakerNotes/XMP"),
     }
 
     if let Some(dir) = &args.export_clean {

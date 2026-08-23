@@ -28,6 +28,7 @@
 //! 5. A linear DNG is written with the same stretch as the stack.
 
 use crate::align::Similarity;
+use crate::exif;
 use crate::fixed;
 use crate::flatten::{self, CellMask};
 use crate::output::{self, StretchParams};
@@ -629,6 +630,7 @@ pub fn export_sequence(
     let mut next_load = 0usize;
     let mut next_emit = 0usize;
     let mut meta_failed = false;
+    let mut exif_failed = false;
     let batch = opts.n_workers.max(1);
 
     while next_emit < order.len() {
@@ -792,6 +794,14 @@ pub fn export_sequence(
         let stem = paths[idx].file_stem().unwrap().to_string_lossy();
         let out = opts.dir.join(format!("{stem}_clean.dng"));
         output::write_dng_quiet(&out, &img, ow, oh, opts.camera_model, opts.stretch)?;
+        // Each exported frame carries its **own** source frame's metadata,
+        // not the reference's: the capture time is what turns the sequence
+        // back into a timelapse in the developer.
+        match exif::read_source(&paths[idx]) {
+            Ok(e) => exif::embed(&out, &e)
+                .with_context(|| format!("writing EXIF into {}", out.display()))?,
+            Err(_) => exif_failed = true,
+        }
         if output::copy_metadata(&paths[idx], &out).is_err() {
             meta_failed = true;
         }
@@ -815,8 +825,11 @@ pub fn export_sequence(
             }
         }
     }
+    if exif_failed {
+        println!("  WARNING: could not read the source EXIF on some frames");
+    }
     if meta_failed {
-        println!("  WARNING: could not copy EXIF with exiftool on some frames (is it installed?)");
+        println!("  WARNING: could not copy MakerNotes/XMP with exiftool on some frames (is it installed?) — the DNGs still carry the EXIF written natively");
     }
     println!("exported {} frames in {:.1}s", order.len(), t0.elapsed().as_secs_f32());
     Ok(())

@@ -50,10 +50,12 @@ becomes a star-trail image, which is what averaging a fixed sequence means.
 ## Requirements
 
 - A Rust toolchain (edition 2021).
-- [`exiftool`](https://exiftool.org/) on `PATH`. It is not needed to produce the
-  image data, only to copy EXIF, MakerNotes, XMP and ICC from the source RAW
-  into the output DNG; if it is missing, the DNG is still valid and the run only
-  warns.
+- [`exiftool`](https://exiftool.org/) on `PATH`, optional. Every DNG already
+  carries the EXIF that identifies the shot — camera, lens, focal length,
+  aperture, exposure, ISO and capture time — written natively with no external
+  tool, which is what a raw developer matches a lens profile on. exiftool is
+  only needed to carry across everything *beyond* that: MakerNotes, XMP and
+  ICC. If it is missing the run warns and the native EXIF stays.
 - Linux is the tested platform. The RAM planner reads `/proc/meminfo` and falls
   back to a conservative 4 GiB assumption elsewhere.
 - Optional, for the audit scripts in `comparison/`: Python 3 with NumPy and
@@ -457,9 +459,22 @@ DNG 1.4.0.0) with the demosaic step already done, `WhiteLevel = 65535`,
 `BlackLevel = 0`, a D65 `ColorMatrix1` looked up per camera model (Sony A7 III,
 A7 IV, A7R III/IIIA, A7R IV/IVA and A6400, with an identity fallback), and
 `AsShotNeutral = [1, 1, 1]` because white balance is already baked in — which
-prevents the developer from applying it a second time. Finally, `exiftool` copies
-the source metadata across, excluding the structural and DNG tags the writer
-controls itself.
+prevents the developer from applying it a second time.
+
+The photographic metadata of the source RAW is then written in natively: make
+and model in IFD0, and lens make and model, focal length (and its 35 mm
+equivalent), aperture, exposure time, ISO and capture time in a real Exif IFD,
+which is where exiv2 — and therefore darktable and lensfun — look for them. That
+is exactly the set a lens profile is matched on, so distortion, vignetting and
+chromatic aberration corrections light up on a bare DNG with nothing installed.
+The DNG is not rewritten to do it: TIFF places no constraint on where an IFD
+lives, so the new IFD0 and the Exif IFD are appended to the end of the file and
+the header is repointed at them, leaving the image strips and every value the
+original IFD0 referenced exactly where they were.
+
+Finally `exiftool`, if it is on `PATH`, copies the rest of the source metadata
+across — MakerNotes, XMP, ICC — excluding the structural and DNG tags the writer
+controls itself. Without it the DNG keeps the native EXIF and only loses those.
 
 ### 7. Timelapse export
 
@@ -470,6 +485,16 @@ own anomaly, stabilized into the reference system with the very transform used
 for stacking and cropped identically, then levelled: per channel, its sky median
 and its 99.9th percentile are matched to the stack's by a linear gain and offset,
 which stops tone, brightness and contrast from drifting across the session.
+
+On an untracked sequence the levels reference is **not** the stack, and neither
+is the stretch. There the stack is a star-trail image: a star lands on a given
+pixel in only a few frames, so the mean divides its flux by the length of the
+session and the stack's high percentile no longer stands for a star core.
+Matching every exported frame to that would crush its contrast, frame after
+frame. Both the reference and the stretch are taken instead from one
+representative frame — the one whose sky level sits closest to the session
+median — cleaned exactly as the export cleans it. The run names the frame it
+picked.
 
 Temporal noise is then reduced by a trimmed mean over a sliding window of
 `--export-window` frames, discarding the per-pixel maximum and minimum — a choice
@@ -565,7 +590,8 @@ export cost at the price of the noise reduction.
 | `src/fixed.rs` | Untracked sequences: tripod-drift measurement by cross-correlation, sky transform between consecutive frames. |
 | `src/flatten.rs` | Background maps, foreground masks, consensus mask, the four-stage defect model, per-frame anomaly, correction grid. |
 | `src/stack.rs` | Weighted accumulator, coverage tracking and valid-rectangle cropping. |
-| `src/output.rs` | Stretch analysis, linear DNG writing, metadata copying. |
+| `src/output.rs` | Stretch analysis, linear DNG writing, metadata copying through exiftool. |
+| `src/exif.rs` | Native EXIF: reads the source RAW's identifying and photographic tags and writes them into the DNG by relocating its IFD0. |
 | `src/timelapse.rs` | Clean sequence export: stabilization, deflickering, temporal denoising, transient preservation, dawn ramp. |
 | `comparison/` | Stage-by-stage before/after evidence and the audit scripts (the images themselves are not versioned; regenerate them locally). |
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
@@ -585,7 +611,15 @@ export cost at the price of the noise reduction.
 - **Frames must be chronological by filename.** In-camera numbering is; renamed
   files may not be.
 - **A framing that is all sky** gives `--fixed-tripod` nothing to correlate
-  against; below 2 % landscape it declines to estimate the drift.
+  against; below 2 % landscape it declines to estimate the drift and leaves
+  every frame at identity — which for a tripod that genuinely did not move is
+  the right answer anyway.
+- **The export window of an untracked sequence rests on a similarity.** The
+  sky's apparent motion is a rotation on the celestial sphere; a similarity only
+  approximates it, and the wider the field or the longer the interval, the worse
+  the approximation. The run reports the median residual of the fit between
+  consecutive frames and warns past a pixel; if the stars come out soft, lower
+  `--export-window`.
 
 ## Licence
 
