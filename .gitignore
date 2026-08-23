@@ -1,11 +1,11 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock is versioned on purpose: this crate is a binary, so the lockfile
+# is what makes a build reproducible — and it is what pins the vendored
+# rawloader patched in from Cargo.toml.
 
 # Input data (camera RAW)
 res*/
-res_old/
-res_clean/
 *.ARW
 *.arw
 *.CR2
