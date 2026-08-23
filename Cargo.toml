@@ -16,3 +16,10 @@ rayon = "1"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# rawloader 0.37.2 (its latest release) has no entry for the Sony A6400, so it
+# refuses those files outright. The vendored copy under vendor/rawloader is
+# that release with `data/cameras/sony/a6400.toml` added and nothing else
+# changed; adding another body is one more file of the same ten lines.
+[patch.crates-io]
+rawloader = { path = "vendor/rawloader" }
