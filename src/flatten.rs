@@ -1698,11 +1698,35 @@ pub struct FrameCorr {
     pub level_ratio: f32,
 }
 
-/// Bounds on the per-frame dome amplitude. A sky level ratio outside this
-/// range would mean a frame that is not part of the same session, so these
-/// only catch an ill-conditioned fit.
+/// Outer backstop on the per-frame dome amplitude.
 const DOME_GAIN_MIN: f32 = 0.3;
 const DOME_GAIN_MAX: f32 = 3.0;
+/// Slack allowed either side of the physical interval the dome amplitude has
+/// to lie in (see `dome_bounds`): room for fit noise and for stray light
+/// that scales slightly faster than the sky it comes from.
+const DOME_MARGIN: f32 = 0.15;
+
+/// Bounds the per-frame dome amplitude by what physics allows.
+///
+/// The model's smooth dome mixes a multiplicative part (vignetting, which
+/// scales with the sky level, so its factor is `level_ratio`) and an additive
+/// one (stray light from a fixed source, which does not scale, factor 1).
+/// Any mixture of the two lands between those endpoints, so that interval —
+/// widened by `DOME_MARGIN` — is where the amplitude must sit.
+///
+/// This is also what keeps a passing cloud from hijacking the fit. A bright
+/// cloud is a large off-centre structure, and its least squares projection
+/// onto the dome's fixed radial shape is far from zero, so an unbounded fit
+/// runs away (measured: ×3 on cloud frames, against a sky only twice the
+/// median). Both endpoints here are robust to it: 1 is a constant, and
+/// `level_ratio` comes from a median over the sky cells, which a cloud
+/// covering less than half the frame cannot move. No cloud detector needed.
+fn dome_bounds(level_ratio: f32) -> (f32, f32) {
+    let r = if level_ratio.is_finite() && level_ratio > 0.0 { level_ratio } else { 1.0 };
+    let lo = (r.min(1.0) * (1.0 - DOME_MARGIN)).max(DOME_GAIN_MIN);
+    let hi = (r.max(1.0) * (1.0 + DOME_MARGIN)).min(DOME_GAIN_MAX);
+    (lo, hi.max(lo))
+}
 
 /// Radii (in r_full) of the gain ramp (0 in the core → 1 outside).
 const FRAME_GAIN_R0: f32 = 0.20;
@@ -1912,12 +1936,11 @@ pub fn fit_frame_corr_ex(
     if !bright {
         for c in 0..3 { gain[c] = (1.0 + coef[c]).clamp(1.0, 3.0); }
     }
-    // Amplitude of the model's smooth dome for this frame. The physical
-    // expectation is `level_ratio` (vignetting scales with the sky level);
-    // the bounds only stop an ill-conditioned fit from running away, they
-    // are far outside the range a real sky level ratio reaches.
+    // Amplitude of the model's smooth dome for this frame, held inside the
+    // interval physics allows for it (see `dome_bounds`).
+    let (dome_lo, dome_hi) = dome_bounds(level_ratio);
     let mut dome = [1.0f32; 3];
-    for c in 0..3 { dome[c] = (1.0 + coef_dome[c]).clamp(DOME_GAIN_MIN, DOME_GAIN_MAX); }
+    for c in 0..3 { dome[c] = (1.0 + coef_dome[c]).clamp(dome_lo, dome_hi); }
     let mut pedestal = [0.0f32; 3];
     let mut range = [0.0f32; 3];
     let mut vals: Vec<[f32; 3]> = Vec::with_capacity(n);
