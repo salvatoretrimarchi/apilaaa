@@ -3,7 +3,7 @@
 //! For every frame, in chronological order:
 //! 1. Load + clean in sensor coordinates (`flatten::clean_frame` with the
 //!    global model plus the frame's own temporal anomaly,
-//!    `flatten::fit_frame_corr`: horizon glow/twilight and halo variation
+//!    `flatten::fit_frame_corr_ex`: horizon glow/twilight and halo variation
 //!    with respect to the session median).
 //! 2. **Stabilization**: resampled to the reference system with the same
 //!    similarity transform (rotation + translation) used by the stacking,
@@ -28,6 +28,7 @@
 //! 5. A linear DNG is written with the same stretch as the stack.
 
 use crate::align::Similarity;
+use crate::fixed;
 use crate::flatten::{self, CellMask};
 use crate::output::{self, StretchParams};
 use crate::raw;
@@ -214,6 +215,98 @@ pub fn combine_window(frames: &[&[f32]], masks: &[&[u8]], cur: usize) -> Vec<f32
     out
 }
 
+/// Same trimmed mean as `combine_window`, except that the neighbours are
+/// **not** in the same system as the current frame: neighbour `f` is
+/// sampled at `ts[f](p)` (bilinear) instead of at `p`.
+///
+/// This is what makes temporal noise reduction possible on an untracked
+/// sequence. There the camera is fixed and the sky rotates, so combining
+/// the window as it stands would drag every star into a short trail and
+/// dim it. `ts[f]` takes the current frame's sky to the neighbour's, so
+/// the stars line up while the landscape deliberately does not — and the
+/// landscape is precisely what the mask makes the current frame supply on
+/// its own. A neighbour's own foreground, once displaced by `ts[f]`, lands
+/// on sky it does not belong to; the same mask lookup (in the neighbour's
+/// coordinates, where its landscape still is) throws those samples away,
+/// and so does a sample falling outside the frame.
+pub fn combine_window_warped(
+    frames: &[&[f32]],
+    masks: &[&[u8]],
+    ts: &[Similarity],
+    cur: usize,
+    w: usize,
+    h: usize,
+) -> Vec<f32> {
+    let n = frames.len();
+    assert!(n >= 1 && masks.len() == n && ts.len() == n && cur < n);
+    let (wf, hf) = (w as f32, h as f32);
+    let mut out = vec![0.0f32; w * h * 3];
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let yf = y as f32;
+        let mut buf = [[0.0f32; 64]; 3];
+        for x in 0..w {
+            let i = y * w + x;
+            if masks[cur][i] != 0 {
+                row[x * 3..x * 3 + 3].copy_from_slice(&frames[cur][i * 3..i * 3 + 3]);
+                continue;
+            }
+            let xf = x as f32;
+            let mut m = 0usize;
+            for f in 0..n.min(64) {
+                if f == cur {
+                    for c in 0..3 {
+                        buf[c][m] = frames[cur][i * 3 + c];
+                    }
+                    m += 1;
+                    continue;
+                }
+                let (qx, qy) = ts[f].apply(xf, yf);
+                if qx < 0.0 || qy < 0.0 || qx >= wf - 1.0 || qy >= hf - 1.0 {
+                    continue;
+                }
+                let ix = qx as usize;
+                let iy = qy as usize;
+                if masks[f][iy * w + ix] != 0 {
+                    continue;
+                }
+                let (dx, dy) = (qx - ix as f32, qy - iy as f32);
+                let i00 = (iy * w + ix) * 3;
+                let i10 = i00 + 3;
+                let i01 = ((iy + 1) * w + ix) * 3;
+                let i11 = i01 + 3;
+                let w00 = (1.0 - dx) * (1.0 - dy);
+                let w10 = dx * (1.0 - dy);
+                let w01 = (1.0 - dx) * dy;
+                let w11 = dx * dy;
+                let src = frames[f];
+                for c in 0..3 {
+                    buf[c][m] = src[i00 + c] * w00 + src[i10 + c] * w10 + src[i01 + c] * w01 + src[i11 + c] * w11;
+                }
+                m += 1;
+            }
+            for c in 0..3 {
+                let vals = &buf[c][..m];
+                row[x * 3 + c] = if m >= 4 {
+                    let mut mn = f32::MAX;
+                    let mut mx = f32::MIN;
+                    let mut sum = 0.0f32;
+                    for &v in vals {
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                        sum += v;
+                    }
+                    (sum - mn - mx) / (m - 2) as f32
+                } else if m > 0 {
+                    vals.iter().sum::<f32>() / m as f32
+                } else {
+                    frames[cur][i * 3 + c]
+                };
+            }
+        }
+    });
+    out
+}
+
 /// Ramp (frame sky level / session median) between the night-sky cleaning
 /// and the natural dawn/twilight version.
 const DAWN_R0: f32 = 1.5;
@@ -236,7 +329,7 @@ const TRANSIENT_HP_RADIUS: usize = 32;
 const TRANSIENT_SKY_MIN: f32 = 0.6;
 
 /// Separable box moving average (radius `r`, clipped border) — O(n).
-fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let mut tmp = vec![0.0f32; w * h];
     tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let s = &src[y * w..(y + 1) * w];
@@ -449,6 +542,14 @@ pub struct ExportOpts<'a> {
     pub n_workers: usize,
     /// Contrast compensation β (see `flatten::clean_frame`).
     pub scatter_comp: f32,
+    /// Untracked sequence (fixed tripod): the links of the sky chain
+    /// (`links[k]` = frame k → frame k+1), so the temporal window is
+    /// combined on the sky rather than on the sensor. None = tracked
+    /// sequence, where the frames are already aligned on the sky and the
+    /// window combines them as they stand.
+    pub sky_links: Option<&'a [Option<Similarity>]>,
+    /// Freedom given to the per-frame anomaly (see `flatten::AnomalyMode`).
+    pub anomaly: flatten::AnomalyMode,
 }
 
 /// Exports the sequence. `infos` = aligned frames (similarity ref→cur,
@@ -472,6 +573,18 @@ pub fn export_sequence(
     let window = opts.window.max(1) | 1; // odd
     let half = window / 2;
     let by_idx: HashMap<usize, &FrameInfo> = infos.iter().map(|f| (f.idx, f)).collect();
+    // ref → frame k: the geometry the export warped with (a star-based
+    // similarity when tracked, the tripod drift when not). Identity when
+    // exporting in sensor coordinates, where nothing was warped.
+    let lref = |idx: usize| -> Similarity {
+        if opts.stabilize {
+            by_idx.get(&idx).map(|f| f.m).unwrap_or_else(Similarity::identity)
+        } else {
+            Similarity::identity()
+        }
+    };
+    let crop_in = Similarity::translation(x0 as f32, y0 as f32);
+    let crop_out = Similarity::translation(-(x0 as f32), -(y0 as f32));
 
     // List of exportable frames in chronological order (the aligned ones;
     // without stabilization all of them are exported and the unaligned ones
@@ -544,8 +657,8 @@ pub fn export_sequence(
                         }
                     };
                     let fc = match (&bg, info) {
-                        (Some(bg), _) => flatten::fit_frame_corr(bg, bg_med, model, Some(&mask)),
-                        (None, Some(f)) => flatten::fit_frame_corr(&f.bg, bg_med, model, Some(&mask)),
+                        (Some(bg), _) => flatten::fit_frame_corr_ex(bg, bg_med, model, Some(&mask), opts.anomaly),
+                        (None, Some(f)) => flatten::fit_frame_corr_ex(&f.bg, bg_med, model, Some(&mask), opts.anomaly),
                         (None, None) => unreachable!(),
                     };
                     // Full dawn/twilight: when the frame's sky exceeds
@@ -620,12 +733,37 @@ pub fn export_sequence(
         // Emit frame `next_emit` with the available window.
         let lo = next_emit.saturating_sub(half);
         let hi = (next_emit + half).min(order.len() - 1);
-        let win_entries: Vec<&Entry> = buffer
+        let mut win_entries: Vec<&Entry> = buffer
             .iter()
             .filter(|e| e.0 >= lo && e.0 <= hi)
             .collect();
         if win_entries.is_empty() {
             return Err(anyhow!("empty window at frame {}", next_emit));
+        }
+        // Untracked sequence: each neighbour gets the transform that puts
+        // the current frame's sky onto its own, in the cropped reference
+        // system the buffered images live in. A neighbour the star chain
+        // cannot reach — a frame in between with too few stars, or one that
+        // failed to load — drops out of the window instead of being
+        // combined out of register.
+        let mut ts: Option<Vec<Similarity>> = None;
+        if let Some(links) = opts.sky_links {
+            let c_idx = order[next_emit];
+            let l_c = lref(c_idx);
+            let mut keep: Vec<(&Entry, Similarity)> = Vec::with_capacity(win_entries.len());
+            for e in win_entries.drain(..) {
+                let f_idx = order[e.0];
+                if f_idx == c_idx {
+                    keep.push((e, Similarity::identity()));
+                } else if let Some(s) = fixed::sky_between(links, c_idx, f_idx) {
+                    let t = crop_out.compose(
+                        &lref(f_idx).inverse().compose(&s.compose(&l_c.compose(&crop_in))),
+                    );
+                    keep.push((e, t));
+                }
+            }
+            win_entries = keep.iter().map(|(e, _)| *e).collect();
+            ts = Some(keep.iter().map(|(_, t)| *t).collect());
         }
         let win: Vec<&[f32]> = win_entries.iter().map(|e| e.1.as_slice()).collect();
         let wmasks: Vec<&[u8]> = win_entries.iter().map(|e| e.2.as_slice()).collect();
@@ -635,7 +773,11 @@ pub fn export_sequence(
             .ok_or_else(|| anyhow!("frame {} is not in the buffer", next_emit))?;
         let cur: &[f32] = win[cur_k];
         let gain_txt = win_entries[cur_k].3.clone();
-        let mut img = if win.len() == 1 { cur.to_vec() } else { combine_window(&win, &wmasks, cur_k) };
+        let mut img = match (&ts, win.len()) {
+            (_, 1) => cur.to_vec(),
+            (Some(ts), _) => combine_window_warped(&win, &wmasks, ts, cur_k, ow, oh),
+            (None, _) => combine_window(&win, &wmasks, cur_k),
+        };
         let mut kept_txt = String::new();
         if win.len() > 1 && opts.keep_transients {
             let kept = preserve_transients(cur, &mut img, wmasks[cur_k], ow, oh);

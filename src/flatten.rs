@@ -320,6 +320,24 @@ pub fn foreground_mask(map: &BgMap) -> CellMask {
     CellMask { gw: map.gw, gh: map.gh, block: map.block, data: mask }
 }
 
+/// Single foreground mask for an **untracked** sequence: the camera did
+/// not move, so the landscape sits on the same cells in every frame and a
+/// per-frame mask only adds flicker at the cells that straddle the
+/// threshold — which in the timelapse shows up as a border of noise
+/// switching on and off along the horizon. A cell is landscape when more
+/// than half of the frames see it as such. What occludes the sky in only
+/// some frames (a cloud, a passing headlight) stays out, which is the
+/// wanted answer: it is not landscape.
+pub fn consensus_mask(masks: &[CellMask]) -> CellMask {
+    assert!(!masks.is_empty());
+    let (gw, gh) = (masks[0].gw, masks[0].gh);
+    let half = masks.len() / 2;
+    let data: Vec<bool> = (0..gw * gh)
+        .map(|i| masks.iter().filter(|m| m.data[i]).count() > half)
+        .collect();
+    CellMask { gw, gh, block: masks[0].block, data }
+}
+
 /// Sky level of the frame: median of G over the map cells that are not
 /// foreground (balanced scale).
 pub fn sky_level(map: &BgMap, mask: &CellMask) -> f32 {
@@ -1660,15 +1678,48 @@ const FRAME_GAIN_R1: f32 = 0.35;
 /// of the Milky Way).
 const FRAME_SURF_STEP_CELLS: usize = 8;
 const FRAME_SURF_LAMBDA: f64 = 100.0;
-/// Reduced smoothness and sky level threshold (frame/median) for the
-/// strong twilight/dawn regime.
-const FRAME_SURF_LAMBDA_BRIGHT: f64 = 10.0;
+/// Same, for an untracked sequence (`AnomalyMode::Coarse`): nodes every
+/// 1024 px and ten times the smoothness, so the surface can still follow
+/// the horizon glow growing or the moon rising but not the Milky Way
+/// drifting across the sensor.
+const FIXED_FRAME_SURF_STEP_CELLS: usize = 32;
+const FIXED_FRAME_SURF_LAMBDA: f64 = 1000.0;
+/// Smoothness factor and sky level threshold (frame/median) for the strong
+/// twilight/dawn regime.
+const BRIGHT_LAMBDA_RATIO: f64 = 0.1;
 const FRAME_BRIGHT_RATIO: f32 = 1.6;
+
+/// How much freedom the per-frame anomaly surface is given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnomalyMode {
+    /// Nodes every `FRAME_SURF_STEP_CELLS` cells. Correct for a tracked
+    /// sequence, where the sky barely moves on the sensor and therefore
+    /// cancels in `frame map − session median map`.
+    Full,
+    /// Nodes every `FIXED_FRAME_SURF_STEP_CELLS` cells and a much stiffer
+    /// smoothness. For an untracked sequence: there the sky *does* move,
+    /// so the Milky Way does not cancel in the anomaly and a surface free
+    /// enough to follow it would subtract it as though it were a defect.
+    /// Only structure far broader than the Milky Way — horizon glow,
+    /// twilight, the moon rising — is left to it.
+    Coarse,
+    /// No spatial anomaly at all: the model alone, with the frame's level
+    /// still measured so the dawn ramp keeps working. The safe fallback
+    /// when a scene defeats even the stiff surface.
+    None,
+}
 
 /// Fits the frame's anomaly relative to the session median map (`ref_map`,
 /// the very one the model to be applied was fitted on). `mask` = the
-/// frame's foreground.
-pub fn fit_frame_corr(map: &BgMap, ref_map: &BgMap, model: &GlareModel, mask: Option<&CellMask>) -> FrameCorr {
+/// frame's foreground, `mode` how much freedom the surface is given (see
+/// `AnomalyMode`).
+pub fn fit_frame_corr_ex(
+    map: &BgMap,
+    ref_map: &BgMap,
+    model: &GlareModel,
+    mask: Option<&CellMask>,
+    mode: AnomalyMode,
+) -> FrameCorr {
     let n = map.gw * map.gh;
     let sky = |i: usize| map.is_valid(i) && ref_map.is_valid(i) && mask.map_or(true, |m| !m.data[i]);
     let (gw, gh) = (map.gw, map.gh);
@@ -1683,6 +1734,47 @@ pub fn fit_frame_corr(map: &BgMap, ref_map: &BgMap, model: &GlareModel, mask: Op
             for c in 0..3 { resid0[i][c] = map.data[i * 3 + c] - ref_map.data[i * 3 + c]; }
         }
     }
+    // Frame sky level relative to the median: it drives the dawn ramp of
+    // the export and, below, the twilight regime of the fit.
+    let level_ratio = {
+        let lv = |m: &BgMap| -> f32 {
+            let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| m.data[i * 3 + 1]).collect();
+            if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
+        };
+        let (a, b) = (lv(map), lv(ref_map));
+        if b > 0.0 { a / b } else { 1.0 }
+    };
+    if mode == AnomalyMode::None {
+        // A constant surface: `clean_frame` subtracts the pedestal from
+        // it, so it contributes exactly nothing spatially, and gain 1
+        // leaves the model correction untouched.
+        let mut pedestal = [0.0f32; 3];
+        for c in 0..3 {
+            let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| resid0[i][c]).collect();
+            if v.is_empty() { v.push(0.0); }
+            pedestal[c] = median_inplace(&mut v);
+        }
+        let flat = |v: [f32; 3]| Surface {
+            nx: 2,
+            ny: 2,
+            step: (map.gw.max(map.gh) * map.block) as f32,
+            data: (0..4).flat_map(|_| v).collect(),
+            range: [0.0; 3],
+        };
+        return FrameCorr {
+            surface: flat(pedestal),
+            pedestal,
+            range: [0.0; 3],
+            gain: [1.0; 3],
+            k_lp: flat([0.0; 3]),
+            level_ratio,
+        };
+    }
+    let (surf_step_cells, surf_lambda) = match mode {
+        AnomalyMode::Full => (FRAME_SURF_STEP_CELLS, FRAME_SURF_LAMBDA),
+        AnomalyMode::Coarse => (FIXED_FRAME_SURF_STEP_CELLS, FIXED_FRAME_SURF_LAMBDA),
+        AnomalyMode::None => unreachable!(),
+    };
     // Defect gain fitted jointly with the surface. Only over the **fine
     // structure** of the correction (k minus its moving average over
     // FRAME_SURF_STEP_CELLS cells: halo rings, bands, spokes) and outside
@@ -1693,7 +1785,7 @@ pub fn fit_frame_corr(map: &BgMap, ref_map: &BgMap, model: &GlareModel, mask: Op
     let mut k_lp_data = vec![0.0f32; n * 3];
     let mut k_fine = vec![[0.0f32; 3]; n];
     {
-        let r = FRAME_SURF_STEP_CELLS;
+        let r = surf_step_cells;
         let mut integ = vec![[0.0f64; 4]; (gw + 1) * (gh + 1)];
         for gy in 0..gh {
             for gx in 0..gw {
@@ -1731,27 +1823,19 @@ pub fn fit_frame_corr(map: &BgMap, ref_map: &BgMap, model: &GlareModel, mask: Op
         }
     }
     let k_lp = Surface { nx: gw, ny: gh, step: map.block as f32, data: k_lp_data, range: [0.0; 3] };
-    // Frame sky level relative to the median: in strong twilight/dawn
-    // (> FRAME_BRIGHT_RATIO) the anomaly is a huge gradient (sky lit from
-    // the horizon, ×2–3): the robust fit would reject the edges and the
-    // defect gain is not reliable. There: least squares surface without
-    // rejection, more flexible, and gain 1 (the deep-night model only).
-    let level_ratio = {
-        let lv = |m: &BgMap| -> f32 {
-            let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| m.data[i * 3 + 1]).collect();
-            if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
-        };
-        let (a, b) = (lv(map), lv(ref_map));
-        if b > 0.0 { a / b } else { 1.0 }
-    };
+    // In strong twilight/dawn (> FRAME_BRIGHT_RATIO) the anomaly is a huge
+    // gradient (sky lit from the horizon, ×2–3): the robust fit would
+    // reject the edges and the defect gain is not reliable. There: least
+    // squares surface without rejection, more flexible, and gain 1 (the
+    // deep-night model only).
     let bright = level_ratio > FRAME_BRIGHT_RATIO;
     let (surface, coef) = if bright {
         fit_surface_core(
-            gw, gh, map.block, &resid0, &sky, FRAME_SURF_STEP_CELLS, FRAME_SURF_LAMBDA_BRIGHT, true, None, false,
+            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda * BRIGHT_LAMBDA_RATIO, true, None, false,
         )
     } else {
         fit_surface_core(
-            gw, gh, map.block, &resid0, &sky, FRAME_SURF_STEP_CELLS, FRAME_SURF_LAMBDA, true, Some(&k_fine), true,
+            gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, Some(&k_fine), true,
         )
     };
     let mut gain = [1.0f32; 3];
@@ -1785,7 +1869,7 @@ pub fn fit_frame_corr(map: &BgMap, ref_map: &BgMap, model: &GlareModel, mask: Op
             if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
         };
         // Variant without gain (as before) for comparison.
-        let (surf_old, _) = fit_surface_core(gw, gh, map.block, &resid0, &sky, FRAME_SURF_STEP_CELLS, FRAME_SURF_LAMBDA, true, None, true);
+        let (surf_old, _) = fit_surface_core(gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda, true, None, true);
         let ped_old = {
             let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| { let (x, y) = map.cell_center(i % gw, i / gw); surf_old.eval(x, y)[1] }).collect();
             if v.is_empty() { 0.0 } else { median_inplace(&mut v) }

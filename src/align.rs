@@ -13,11 +13,38 @@ impl Similarity {
         Self { cos_t: 1.0, sin_t: 0.0, tx: 0.0, ty: 0.0 }
     }
 
+    /// Pure translation (no rotation): the residual drift of a fixed
+    /// tripod, and the crop offsets composed with it.
+    pub fn translation(tx: f32, ty: f32) -> Self {
+        Self { cos_t: 1.0, sin_t: 0.0, tx, ty }
+    }
+
     pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
         (
             self.cos_t * x - self.sin_t * y + self.tx,
             self.sin_t * x + self.cos_t * y + self.ty,
         )
+    }
+
+    /// `self ∘ first`: applies `first` and then `self`.
+    pub fn compose(&self, first: &Similarity) -> Similarity {
+        Similarity {
+            cos_t: self.cos_t * first.cos_t - self.sin_t * first.sin_t,
+            sin_t: self.sin_t * first.cos_t + self.cos_t * first.sin_t,
+            tx: self.cos_t * first.tx - self.sin_t * first.ty + self.tx,
+            ty: self.sin_t * first.tx + self.cos_t * first.ty + self.ty,
+        }
+    }
+
+    /// Inverse transform: `q = R·p + t` → `p = Rᵀ·(q − t)`.
+    pub fn inverse(&self) -> Similarity {
+        let (c, s) = (self.cos_t, self.sin_t);
+        Similarity {
+            cos_t: c,
+            sin_t: -s,
+            tx: -(c * self.tx + s * self.ty),
+            ty: -(c * self.ty - s * self.tx),
+        }
     }
 
     pub fn angle_deg(&self) -> f32 {
@@ -78,6 +105,16 @@ fn find_opposite(uniq: &[usize], e1: usize, e2: usize) -> usize {
 }
 
 pub fn fit(ref_stars: &[Star], cur_stars: &[Star]) -> Option<(Similarity, usize)> {
+    fit_ex(ref_stars, cur_stars).map(|(m, n, _)| (m, n))
+}
+
+/// Same as `fit`, also returning the RMS residual (px) of the refined
+/// similarity over its own inliers. On an untracked sequence that residual
+/// is the diagnostic that matters: the sky's apparent motion is a rotation
+/// on the celestial sphere, and a similarity only approximates it over a
+/// small angle, so a residual that grows past a pixel means the temporal
+/// window of the export is reaching too far in time.
+pub fn fit_ex(ref_stars: &[Star], cur_stars: &[Star]) -> Option<(Similarity, usize, f32)> {
     if ref_stars.len() < 3 || cur_stars.len() < 3 {
         return None;
     }
@@ -156,7 +193,17 @@ pub fn fit(ref_stars: &[Star], cur_stars: &[Star]) -> Option<(Similarity, usize)
         .collect();
 
     let refined = fit_least_squares(&inlier_set)?;
-    Some((refined, inlier_set.len()))
+    let rms = {
+        let s: f32 = inlier_set
+            .iter()
+            .map(|(p, q)| {
+                let (qx, qy) = refined.apply(p.x, p.y);
+                (qx - q.x).powi(2) + (qy - q.y).powi(2)
+            })
+            .sum();
+        (s / inlier_set.len() as f32).sqrt()
+    };
+    Some((refined, inlier_set.len(), rms))
 }
 
 fn next_rand(state: &mut u32) -> u32 {

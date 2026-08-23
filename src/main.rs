@@ -1,4 +1,5 @@
 mod align;
+mod fixed;
 mod flatten;
 mod output;
 mod raw;
@@ -7,8 +8,10 @@ mod stars;
 mod timelapse;
 
 use crate::align::Similarity;
+use crate::flatten::AnomalyMode;
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,9 +117,60 @@ struct Args {
     /// time and leaves bands when averaged). With a value > 0, frames below
     /// it are included and only those pixels are masked out. If fewer than
     /// 20 % of the aligned frames are left without foreground, frames are
-    /// automatically admitted with a mask up to 60 %.
-    #[arg(long, default_value_t = 0.0, value_name = "FRAC")]
-    stack_max_foreground: f32,
+    /// automatically admitted with a mask up to 60 %. In --fixed-tripod the
+    /// default is 1: the landscape is in every frame and is part of the
+    /// picture, so it is never a reason to drop a frame.
+    #[arg(long, value_name = "FRAC")]
+    stack_max_foreground: Option<f32>,
+
+    /// **Untracked sequence**: the camera stayed fixed on a tripod for the
+    /// whole timelapse, so the landscape is stationary on the sensor and
+    /// the stars move across it. The star alignment is replaced by the
+    /// measurement of the residual tripod drift, the per-frame anomaly is
+    /// restricted so that the drifting Milky Way is not mistaken for a
+    /// defect, and the temporal window of --export-clean is combined on
+    /// the sky instead of on the sensor. The stack (--output) then comes
+    /// out as a star-trail image, which is what averaging an untracked
+    /// sequence means.
+    #[arg(long)]
+    fixed_tripod: bool,
+
+    /// In --fixed-tripod, do not measure the tripod drift: assume the
+    /// camera was perfectly still and export in sensor coordinates,
+    /// uncropped.
+    #[arg(long)]
+    fixed_no_stabilize: bool,
+
+    /// In --fixed-tripod, maximum tripod drift searched for, in sensor px.
+    #[arg(long, default_value_t = 64, value_name = "PX")]
+    fixed_search: usize,
+
+    /// In --fixed-tripod, how much freedom the per-frame temporal anomaly
+    /// is given. `coarse` (default) lets it follow only structure far
+    /// broader than the Milky Way — horizon glow, twilight, the moon
+    /// rising; `none` drops it entirely and applies the defect model
+    /// alone; `full` uses the same surface as a tracked sequence, which on
+    /// an untracked one will subtract part of the drifting Milky Way.
+    #[arg(long, default_value = "coarse", value_name = "MODE")]
+    fixed_anomaly: AnomalyArg,
+}
+
+/// CLI spelling of `flatten::AnomalyMode`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum AnomalyArg {
+    Coarse,
+    None,
+    Full,
+}
+
+impl From<AnomalyArg> for AnomalyMode {
+    fn from(a: AnomalyArg) -> Self {
+        match a {
+            AnomalyArg::Coarse => AnomalyMode::Coarse,
+            AnomalyArg::None => AnomalyMode::None,
+            AnomalyArg::Full => AnomalyMode::Full,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -141,12 +195,22 @@ fn main() -> Result<()> {
         t0.elapsed().as_secs_f32()
     );
 
+    let untracked = args.fixed_tripod;
+    let anomaly: AnomalyMode = if untracked { args.fixed_anomaly.into() } else { AnomalyMode::Full };
+    // The temporal window of the export needs, on an untracked sequence,
+    // the star chain between consecutive frames; without it there is
+    // nothing to combine the neighbours on.
+    let needs_sky_chain =
+        untracked && args.export_clean.is_some() && (args.export_window.max(1) | 1) > 1;
+
     let lum_ref = raw::luminance(&ref_frame);
     let stars_ref = stars::detect(&lum_ref, ref_frame.width, ref_frame.height, args.max_stars);
-    drop(lum_ref);
     println!("stars in reference: {}", stars_ref.len());
     if stars_ref.len() < 6 {
-        return Err(anyhow!("too few stars in the reference ({}) — check exposure or max_stars", stars_ref.len()));
+        if !untracked {
+            return Err(anyhow!("too few stars in the reference ({}) — check exposure or max_stars", stars_ref.len()));
+        }
+        println!("  WARNING: too few stars for the sky-aligned temporal window; --export-window will fall back to 1");
     }
 
     let camera_model = ref_frame.camera.clone();
@@ -160,14 +224,39 @@ fn main() -> Result<()> {
     // are usable (sky level, foreground) and fit the defect model.
     // ---------------------------------------------------------------
     let mut infos: Vec<FrameInfo> = Vec::new();
+    // Untracked sequence: the reference's landscape, high-passed at two
+    // scales, is what every frame's tripod drift is measured against.
+    let mut drift_template: Option<fixed::Template> = None;
     {
         let bg = flatten::block_background(&ref_frame);
         let mask = flatten::foreground_mask(&bg);
         let level = flatten::sky_level(&bg, &mask);
+        if untracked && !args.fixed_no_stabilize {
+            let tpl = fixed::template(&lum_ref, w_ref, h_ref, &mask);
+            if tpl.usable {
+                println!(
+                    "tripod drift: measured against the reference's landscape ({:.1}% of the frame), up to {} px",
+                    100.0 * tpl.fg_fraction, args.fixed_search
+                );
+            } else {
+                println!(
+                    "tripod drift: NOT measurable (landscape {:.1}% of the frame) — every frame is left at identity",
+                    100.0 * tpl.fg_fraction
+                );
+            }
+            drift_template = Some(tpl);
+        }
         infos.push(FrameInfo { idx: 0, m: Similarity::identity(), bg, mask, level, in_stack: true, aligned: true, inliers: usize::MAX, export: true });
     }
+    drop(lum_ref);
     drop(ref_frame);
     println!("  [1/{}] reference: foreground {:.1}%", paths.len(), 100.0 * infos[0].mask.fraction());
+    // Untracked sequence: each frame's stars, kept so the chain of
+    // consecutive fits can be built after this pass.
+    let mut star_lists: Vec<Vec<stars::Star>> = vec![Vec::new(); paths.len()];
+    if needs_sky_chain {
+        star_lists[0] = stars_ref.clone();
+    }
 
     let n_cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let (n_workers, chan_cap, ram_info) = compute_pipeline_params(w_ref, h_ref, n_cpus, paths.len() - 1);
@@ -198,6 +287,8 @@ fn main() -> Result<()> {
             let next_idx = &next_idx;
             let paths = &paths;
             let stars_ref = &stars_ref;
+            let drift_template = &drift_template;
+            let fixed_search = args.fixed_search;
             s.spawn(move || {
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
@@ -218,9 +309,23 @@ fn main() -> Result<()> {
                                 let lum = raw::luminance(&frame);
                                 let stars_cur =
                                     stars::detect(&lum, frame.width, frame.height, max_stars);
-                                drop(lum);
                                 let n_stars = stars_cur.len();
-                                let fit = align::fit(stars_ref, &stars_cur);
+                                // Tracked: the similarity taking the
+                                // reference's sky onto this frame's.
+                                // Untracked: the sky is not what to align
+                                // on — the landscape is, and only to undo
+                                // the tripod's own drift.
+                                let (fit, shift) = if untracked {
+                                    let s = drift_template.as_ref().and_then(|tpl| {
+                                        let pyr = fixed::pyramid(&lum, frame.width, frame.height);
+                                        fixed::shift(tpl, &pyr, fixed_search)
+                                    });
+                                    (None, s)
+                                } else {
+                                    (align::fit(stars_ref, &stars_cur), None)
+                                };
+                                drop(lum);
+                                let stars = if needs_sky_chain { stars_cur } else { Vec::new() };
                                 // Map, mask and level are computed even without
                                 // an alignment: the frame may still be recovered
                                 // by interpolating its neighbours' alignment.
@@ -232,6 +337,8 @@ fn main() -> Result<()> {
                                     idx,
                                     n_stars,
                                     fit,
+                                    shift,
+                                    stars,
                                     bg,
                                     elapsed: ti.elapsed().as_secs_f32(),
                                 }
@@ -269,9 +376,50 @@ fn main() -> Result<()> {
                 Msg::Processed {
                     idx,
                     n_stars,
+                    shift,
+                    stars,
+                    bg,
+                    elapsed,
+                    ..
+                } if untracked => {
+                    // Untracked: there is no such thing as a frame that
+                    // "fails to align". The camera did not move, so the
+                    // worst case is identity — the very assumption the
+                    // tripod is meant to guarantee.
+                    let (bg, mask, level) = bg.expect("map computed for every loaded frame");
+                    if needs_sky_chain {
+                        star_lists[idx] = stars;
+                    }
+                    let (m, txt) = match shift {
+                        Some((dx, dy, ncc)) => (
+                            Similarity::translation(dx, dy),
+                            format!("drift ({dx:+.2},{dy:+.2}) px, corr {ncc:.2}"),
+                        ),
+                        None => (
+                            Similarity::identity(),
+                            String::from(if args.fixed_no_stabilize { "identity" } else { "drift not measurable, identity" }),
+                        ),
+                    };
+                    infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers: n_stars, export: true });
+                    aligned += 1;
+                    println!(
+                        "  [{}/{}] {}: {} stars, {}, sky {:.4} in {:.2}s",
+                        idx + 1,
+                        total,
+                        paths[idx].file_name().unwrap().to_string_lossy(),
+                        n_stars,
+                        txt,
+                        level,
+                        elapsed
+                    );
+                }
+                Msg::Processed {
+                    idx,
+                    n_stars,
                     fit,
                     bg,
                     elapsed,
+                    ..
                 } => {
                     match (fit, bg) {
                         (Some((m, inliers)), Some((bg, mask, level))) if inliers >= MIN_INLIERS => {
@@ -324,7 +472,7 @@ fn main() -> Result<()> {
     // enter the stack. Frames without an alignment are recovered the same
     // way.
     // ---------------------------------------------------------------
-    {
+    if !untracked {
         let mut n_fixed = 0usize;
         let mut bad: Vec<usize> = Vec::new();
         for k in 0..infos.len() {
@@ -382,13 +530,76 @@ fn main() -> Result<()> {
     );
 
     // ---------------------------------------------------------------
+    // Untracked sequence: one landscape for the whole session, and the
+    // chain of consecutive sky fits the export's temporal window runs on.
+    // ---------------------------------------------------------------
+    let mut sky_links: Vec<Option<Similarity>> = Vec::new();
+    if untracked {
+        {
+            let masks: Vec<flatten::CellMask> = infos.iter().map(|f| f.mask.clone()).collect();
+            let consensus = flatten::consensus_mask(&masks);
+            drop(masks);
+            println!(
+                "landscape: single consensus mask over {} frames, {:.1}% of the frame",
+                infos.len(),
+                100.0 * consensus.fraction()
+            );
+            for f in infos.iter_mut() {
+                f.mask = consensus.clone();
+                f.level = flatten::sky_level(&f.bg, &f.mask);
+            }
+        }
+        if needs_sky_chain && stars_ref.len() >= 6 {
+            let tc = Instant::now();
+            let fits: Vec<Option<(Similarity, f32)>> = (0..paths.len().saturating_sub(1))
+                .into_par_iter()
+                .map(|k| {
+                    let (a, b) = (&star_lists[k], &star_lists[k + 1]);
+                    if a.len() < 3 || b.len() < 3 {
+                        return None;
+                    }
+                    align::fit_ex(a, b)
+                        .and_then(|(m, inl, rms)| (inl >= MIN_INLIERS).then_some((m, rms)))
+                })
+                .collect();
+            let links: Vec<Option<Similarity>> = fits.iter().map(|f| f.map(|(m, _)| m)).collect();
+            // The residual of a one-frame link is the honest measure of how
+            // far a similarity can stand in for the sky's real motion. Past
+            // a pixel it is already bending, and the window should not
+            // reach as far in time as it is being asked to.
+            let mut rms: Vec<f32> = fits.iter().filter_map(|f| f.map(|(_, r)| r)).collect();
+            let med_rms = if rms.is_empty() {
+                f32::NAN
+            } else {
+                let k = rms.len() / 2;
+                let (_, m, _) = rms.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+                *m
+            };
+            let ok = links.iter().filter(|l| l.is_some()).count();
+            println!(
+                "sky chain: {} of {} consecutive links fitted in {:.1}s (median residual {:.2} px)",
+                ok, links.len(), tc.elapsed().as_secs_f32(), med_rms
+            );
+            if med_rms > 1.0 {
+                println!(
+                    "  WARNING: a similarity already leaves {:.2} px between consecutive frames — the sky's motion is not one at this field of view or interval. Lower --export-window (or set it to 1) if the stars come out soft.",
+                    med_rms
+                );
+            }
+            sky_links = links;
+        }
+        drop(star_lists);
+    }
+
+    // ---------------------------------------------------------------
     // Frame selection for stacking: drop the ones with too much
     // foreground and the ones whose sky is anomalously bright or dark
     // compared to the session (twilight, clouds, moon rising).
     // ---------------------------------------------------------------
+    let med_level;
     {
         let mut lv: Vec<f32> = infos.iter().map(|f| f.level).filter(|v| *v > 0.0).collect();
-        let med_level = if lv.is_empty() {
+        med_level = if lv.is_empty() {
             0.0
         } else {
             let k = lv.len() / 2;
@@ -396,7 +607,12 @@ fn main() -> Result<()> {
             *m
         };
         let tol = args.stack_sky_tolerance.max(1.0);
-        let mut max_fg = args.stack_max_foreground.max(0.0);
+        // Untracked: the landscape is in every frame and is part of the
+        // picture, never a reason to drop one.
+        let mut max_fg = args
+            .stack_max_foreground
+            .unwrap_or(if untracked { 1.0 } else { 0.0 })
+            .max(0.0);
         let n_clear = infos.iter().filter(|f| f.aligned && f.mask.fraction() <= max_fg).count();
         if n_clear < (infos.len() / 5).max(1) && max_fg < 0.6 {
             println!(
@@ -496,7 +712,7 @@ fn main() -> Result<()> {
     };
     // A single model, fitted over the median of the selected frames (clear
     // sky, no twilight): it also serves as the reference for the temporal
-    // anomaly of every frame in the sequence (`fit_frame_corr`), which
+    // anomaly of every frame in the sequence (`fit_frame_corr_ex`), which
     // absorbs whatever that frame has more or less of compared to that
     // median (horizon glow, twilight, halo amplitude).
     let stack_model = if flatten_on { Some(fit_model(&stack_infos, "stack")?) } else { None };
@@ -510,7 +726,11 @@ fn main() -> Result<()> {
     {
         let ts = Instant::now();
         let n_stack = stack_infos.len();
-        println!("stacking {} frames...", n_stack);
+        println!(
+            "stacking {} frames{}...",
+            n_stack,
+            if untracked { " (untracked: the mean of a fixed sequence is a star-trail image)" } else { "" }
+        );
         let next_k = AtomicUsize::new(0);
         let scatter_comp = args.scatter_comp;
         let (tx, rx) = sync_channel::<Result<(usize, Vec<f32>)>>(chan_cap);
@@ -538,7 +758,7 @@ fn main() -> Result<()> {
                                 }
                                 let img = match model {
                                     Some((bg_med, m)) => {
-                                        let fc = flatten::fit_frame_corr(&info.bg, bg_med, m, Some(&info.mask));
+                                        let fc = flatten::fit_frame_corr_ex(&info.bg, bg_med, m, Some(&info.mask), anomaly);
                                         flatten::clean_frame(m, &frame, Some(&fc), false, scatter_comp)
                                     }
                                     None => {
@@ -562,7 +782,12 @@ fn main() -> Result<()> {
             while let Ok(r) = rx.recv() {
                 let (k, img) = r?;
                 let info = stack_infos[k];
-                acc.add(&img, w_ref, h_ref, [1.0; 3], &info.m, Some(&info.mask));
+                // Untracked: the landscape is stationary on the sensor, so
+                // masking it would leave it with no sample from any frame at
+                // all — a black cutout instead of the ground the trails are
+                // meant to stand over. It is stacked like everything else.
+                let mask = if untracked { None } else { Some(&info.mask) };
+                acc.add(&img, w_ref, h_ref, [1.0; 3], &info.m, mask);
                 done += 1;
                 if done % 25 == 0 || done == n_stack {
                     println!("  [{}/{}] stacked ({:.1}s)", done, n_stack, ts.elapsed().as_secs_f32());
@@ -638,19 +863,72 @@ fn main() -> Result<()> {
             return Err(anyhow!("--export-clean requires the correction to be enabled (drop --no-flatten)"));
         };
         let (cx0, cy0, _, _) = acc.valid_bounds();
-        let stabilize = !args.export_no_stabilize;
+        // Untracked: the stabilization is the tripod-drift correction, and
+        // the temporal window works on the sky chain rather than on frames
+        // that are already aligned, so it survives exporting in sensor
+        // coordinates.
+        let stabilize = !args.export_no_stabilize && !(untracked && args.fixed_no_stabilize);
+        let window = if stabilize || untracked { args.export_window } else { 1 };
+        // Levels reference. On a tracked sequence the stack is the right
+        // one: it is the same sky as every frame, only deeper. On an
+        // untracked one it is a star-trail image — a star lands on a given
+        // pixel in only a few frames, so the mean divides its flux by the
+        // length of the session and the stack's high percentile no longer
+        // stands for a star core. Matching the exported frames to that
+        // would crush their contrast frame after frame, so both the
+        // deflicker reference and the stretch come instead from one
+        // representative frame, cleaned exactly as the export cleans it.
+        let (reference, export_stretch) = if untracked {
+            let rep = infos
+                .iter()
+                .filter(|f| f.in_stack)
+                .min_by(|a, b| {
+                    let d = |f: &FrameInfo| (f.level - med_level).abs();
+                    d(a).partial_cmp(&d(b)).unwrap()
+                })
+                .ok_or_else(|| anyhow!("no frame available as the export's levels reference"))?;
+            println!(
+                "levels reference: {} (sky {:.4}, closest to the session median {:.4}) — the star-trail stack is not one",
+                paths[rep.idx].file_name().unwrap().to_string_lossy(), rep.level, med_level
+            );
+            let frame = raw::load(&paths[rep.idx])
+                .with_context(|| format!("loading the levels reference {}", paths[rep.idx].display()))?;
+            let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.mask), anomaly);
+            let img = flatten::clean_frame(model, &frame, Some(&fc), true, args.scatter_comp);
+            drop(frame);
+            let (img, pmask) = if stabilize {
+                (
+                    timelapse::warp_to_ref(&img, w_ref, h_ref, &rep.m, cx0, cy0, out_w, out_h),
+                    timelapse::warp_mask_to_ref(&rep.mask, w_ref, h_ref, &rep.m, cx0, cy0, out_w, out_h),
+                )
+            } else {
+                let mut pm = vec![0u8; w_ref * h_ref];
+                for y in 0..h_ref {
+                    for x in 0..w_ref {
+                        pm[y * w_ref + x] = rep.mask.at_px(x as f32 + 0.5, y as f32 + 0.5) as u8;
+                    }
+                }
+                (img, pm)
+            };
+            let stats = timelapse::stats(&img, Some(&pmask));
+            let st = if args.no_stretch { None } else { Some(output::analyze_stretch(&img)) };
+            (stats, st)
+        } else {
+            (timelapse::stats(&out, None), stretch)
+        };
         let opts = timelapse::ExportOpts {
             dir,
-            window: if stabilize { args.export_window } else { 1 },
+            window,
             stabilize,
             deflicker: !args.export_no_deflicker,
             keep_transients: !args.export_no_transients,
             camera_model: &camera_model,
-            stretch,
+            stretch: export_stretch,
             n_workers,
             scatter_comp: args.scatter_comp,
+            sky_links: if sky_links.is_empty() { None } else { Some(&sky_links) },
+            anomaly,
         };
-        let reference = timelapse::stats(&out, None);
         drop(out);
         drop(acc);
         timelapse::export_sequence(&paths, &infos, model, bg_med, (cx0, cy0, out_w, out_h), reference, &opts)?;
@@ -770,6 +1048,14 @@ enum Msg {
         idx: usize,
         n_stars: usize,
         fit: Option<(Similarity, usize)>,
+        /// Untracked sequence: (dx, dy, correlation) of the tripod drift
+        /// against the reference's landscape. None when it could not be
+        /// measured, or on a tracked sequence.
+        shift: Option<(f32, f32, f32)>,
+        /// Untracked sequence: the frame's stars, kept so the chain of
+        /// consecutive sky fits can be built after the pass. Empty when
+        /// the chain is not needed.
+        stars: Vec<stars::Star>,
         bg: Option<(flatten::BgMap, flatten::CellMask, f32)>,
         elapsed: f32,
     },
