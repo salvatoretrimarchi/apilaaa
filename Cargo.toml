@@ -2,6 +2,8 @@
 name = "apilaaa"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+description = "RAW astrophotography stacker: star alignment, optical defect removal, linear DNG output and flicker-free timelapse export"
 
 [dependencies]
 rawloader = "0.37"

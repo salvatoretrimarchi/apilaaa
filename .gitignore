@@ -19,9 +19,9 @@ res_clean/
 *.tiff
 *.dng
 *.png
-!comparaciones/*.png
+!comparison/*.png
 
-# Development sidecars (the ones in comparaciones/ are versioned)
+# Development sidecars (the ones in comparison/ are versioned)
 /*.xmp
 
 # Benchmarks and profiling
