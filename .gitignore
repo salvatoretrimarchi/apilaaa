@@ -3,7 +3,7 @@ target/
 Cargo.lock
 
 # Input data (camera RAW)
-res/*
+res*/
 res_old/
 res_clean/
 *.ARW
