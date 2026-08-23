@@ -19,7 +19,9 @@ res_clean/
 *.tiff
 *.dng
 *.png
-!comparison/*.png
+# The before/after images of comparison/ are deliberately NOT versioned: they
+# are ~6 MB each and are regenerated from the output DNGs with the scripts in
+# that directory (see comparison/README.md).
 
 # Development sidecars (the ones in comparison/ are versioned)
 /*.xmp

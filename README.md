@@ -264,6 +264,11 @@ is a strict before/after: the previous stage on the left, the new one on the
 right, **both stretched identically** (percentile 0.5–99.8) so the comparison is
 honest rather than flattering.
 
+The images themselves are **not versioned** — around 6 MB each — so a fresh
+clone gets the scripts, the sidecars and the table below, and the images are
+regenerated locally from your own output DNGs with the commands at the end of
+this section.
+
 | # | Image | What the stage does, and what the pair proves |
 |---|---|---|
 | 01 | `01_flatten_poly3_radial.png` | No correction → parametric model. `poly3(x, y)` for the light-pollution gradient, a free radial profile about a *searched* optical axis for the halo, pupil ring and vignetting, plus `cos2θ`/`cos4θ` harmonics for non-circular vignetting from a hood or filter holder. The bowl and the halo go; the Milky Way stays, because it is rejected as an outlier by the robust fit. |
@@ -562,13 +567,15 @@ export cost at the price of the noise reduction.
 | `src/stack.rs` | Weighted accumulator, coverage tracking and valid-rectangle cropping. |
 | `src/output.rs` | Stretch analysis, linear DNG writing, metadata copying. |
 | `src/timelapse.rs` | Clean sequence export: stabilization, deflickering, temporal denoising, transient preservation, dawn ramp. |
-| `comparison/` | Stage-by-stage before/after evidence and the audit scripts. |
+| `comparison/` | Stage-by-stage before/after evidence and the audit scripts (the images themselves are not versioned; regenerate them locally). |
+| `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
 
 ## Limits
 
-- **Sony `.ARW` only** in practice. Decoding goes through `rawloader`, which
-  reads far more formats, but the file listing and the colour matrices are
-  written for Sony; another brand will decode and stack with an identity matrix.
+- **Sony `.ARW` only.** The input listing accepts the `.ARW` extension and
+  nothing else. Decoding goes through `rawloader`, which reads far more formats,
+  so widening the filter is a one-line change — but the colour matrices are
+  written for Sony bodies and another brand would stack with an identity matrix.
 - **One night per run.** The defect model is fitted on the session's own median,
   so mixing sessions — or lenses, or focal lengths — breaks the assumption that
   the defects are stationary.
