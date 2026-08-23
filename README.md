@@ -93,6 +93,71 @@ Before committing a whole night, try the first few dozen frames:
 `--limit` cuts the run to the first N files, which is enough to see whether the
 stars are detected, the alignment locks and the defect model looks sane.
 
+## Tracked or fixed tripod?
+
+This is the first decision of a run, and the only one the tool cannot make for
+you: **was the camera following the sky, or was it not?**
+
+| Your setup | What is fixed on the sensor | Run it as |
+|---|---|---|
+| The camera rode a star tracker or an equatorial mount, so the stars stayed put across the whole session | The **sky**; the landscape, if any, drifts through the frame | default, no flag |
+| The camera sat on a plain tripod, head locked, nothing motorized | The **landscape**; the stars sweep across it | `--fixed-tripod` |
+
+```sh
+apilaaa -i res -o stacked.dng                  # tracked
+apilaaa -i res -o trails.dng --fixed-tripod    # untracked
+```
+
+If you are unsure which you shot, open the first and the last frame of the night
+side by side. Whichever of the two — stars or landscape — is in the same place in
+both is what the sequence is fixed to, and that is the mode you want.
+
+### What the flag changes
+
+Both modes are the same two-pass pipeline; `--fixed-tripod` swaps the stages
+that depend on which signal is the stationary one.
+
+| Stage | Tracked (default) | `--fixed-tripod` |
+|---|---|---|
+| Registration | Triangle matching over the detected stars, RANSAC, least-squares similarity — rotation *and* translation | Two-scale normalized cross-correlation of the high-passed luminance, restricted to the landscape cells; translation only, sub-pixel, capped at `--fixed-search` px |
+| Foreground mask | One per frame | A single consensus mask: a cell is landscape when more than half the frames see it as such |
+| Per-frame anomaly | `Full` | `--fixed-anomaly`, `coarse` by default, so the drifting Milky Way is not read as a defect |
+| `--stack-max-foreground` | Defaults to `0.0`: only clear-sky frames are averaged | Defaults to `1.0`: the landscape is part of the picture, never a reason to drop a frame |
+| The stack (`-o`) | A deep still — pinpoint stars, the landscape smeared by its own motion | A star-trail image — fixed landscape, the stars drawn as arcs |
+| `--export-clean` window | Combined on the stabilized frames directly: registration already put the sky in place | Warped onto the sky through the chain of star fits between consecutive frames, then combined |
+| Export levels and stretch | Taken from the stack | Taken from one representative frame (the sky level closest to the session median), because a trail stack has no star cores to match against; the run names the frame it picked |
+
+Everything else — the defect model, the frame selection by sky level, the
+deflickering, the transient rescue, the dawn ramp — is identical in both modes,
+which is why the flags in [Options](#options) apply to both unless the table
+says otherwise.
+
+### Picking the wrong one
+
+Neither mistake damages anything — inputs are only ever read — but neither gives
+a usable result. The second announces itself in the console; the first you see
+in the stack:
+
+- **Default on an untracked night.** The star alignment locks anyway, because
+  stars are exactly what it matches: you get the sky registered and the
+  landscape smeared across the frame, and the anomaly, at `Full` freedom over a
+  Milky Way that is moving through the sensor, takes part of it with it. The
+  symptom is a stack with round stars over a doubled or streaked horizon —
+  every frame masks its landscape in a different place, so that region ends up
+  a partial average rather than a picture.
+- **`--fixed-tripod` on a tracked night.** The correlation goes looking for a
+  stationary landscape and finds one that is moving, usually much further than
+  the `--fixed-search` range, so the peak falls under the acceptance threshold
+  (`0.25`) and the run prints `drift not measurable, identity` frame after
+  frame, stacking everything unregistered. A framing with under 2 % landscape
+  never gets that far and announces it at the start:
+  `tripod drift: NOT measurable (landscape 0.4% of the frame)`.
+
+A third case is legitimate rather than a mistake: an untracked sequence on a
+tripod you are confident never moved at all. `--fixed-tripod --fixed-no-stabilize`
+skips the drift measurement, keeps every frame in sensor coordinates and exports
+uncropped.
+
 ## Recipes
 
 ### Deep stack from a tracked sequence
@@ -120,14 +185,13 @@ frames rejected from the stack (twilight, clouds, frames with the horizon in
 them) are still exported, because a frame that is bad for averaging is usually
 perfectly fine in a moving sequence.
 
-To turn the result into a video, develop the DNGs however you like and encode
-them, for example:
+There is no export-only mode, and that is deliberate: the stack is the reference
+the deflickering matches every frame against, so it is always computed and
+written. If the still is not what you came for, point `-o` at a throwaway path
+and keep the sequence.
 
-```sh
-# after developing res_clean/*.dng to res_clean/*.jpg with your raw developer
-ffmpeg -framerate 24 -pattern_type glob -i 'res_clean/*.jpg' \
-       -c:v libx264 -crf 16 -pix_fmt yuv420p timelapse.mp4
-```
+To turn the result into a video, develop the DNGs however you like and encode
+them — see [Encoding the sequence](#encoding-the-sequence).
 
 ### Untracked sequence on a fixed tripod
 
@@ -135,18 +199,22 @@ ffmpeg -framerate 24 -pattern_type glob -i 'res_clean/*.jpg' \
 ./target/release/apilaaa -i res -o trails.dng --fixed-tripod --export-clean res_clean
 ```
 
-The camera never moved, so the landscape is stationary and the stars sweep
-across it. `--fixed-tripod` measures the residual tripod drift (wind, legs
-settling) by normalized cross-correlation of the high-passed luminance
-restricted to the landscape cells, so the moving stars cannot pull the estimate.
-A single **consensus landscape mask** replaces the per-frame one — a cell is
-landscape when more than half the frames see it as such — which stops the
-horizon edge from flickering cell by cell through the sequence. The per-frame
-anomaly is stiffened to `coarse` by default so it follows only structure far
-broader than the Milky Way. The stack comes out as star trails.
+One run gives both halves of what a fixed-tripod night is good for: a
+star-trail still in `trails.dng` and a stabilized, cleaned sequence in
+`res_clean` where the landscape stands still and the sky turns over it. The
+residual drift — wind, legs settling into soft ground — is measured off the
+landscape and taken out, which is what keeps the horizon from jittering through
+the sequence; see [What the flag changes](#what-the-flag-changes) for the full
+list of what the mode swaps.
 
-Knobs specific to this mode: `--fixed-search` (drift range in px),
-`--fixed-anomaly coarse|none|full`, `--fixed-no-stabilize`.
+Tune it with `--fixed-search` (how far the drift is looked for, in px),
+`--fixed-anomaly coarse|none|full` (how much per-frame structure may be
+subtracted before it starts eating the Milky Way) and `--fixed-no-stabilize`
+(skip the drift measurement entirely).
+
+If the trails come out as dashes rather than continuous arcs, that is the
+interval between exposures, not the tool: the stack draws exactly what the
+sensor saw, gaps included.
 
 ### Audit what was actually removed
 
@@ -158,14 +226,107 @@ Then open `stacked.dng` and `layer.dng` side by side. See
 [Auditing the correction](#auditing-the-correction) below for the full
 procedure and what a healthy removed layer looks like.
 
-### When the model misbehaves
-
-Two safety knobs, in order of severity:
+### Leave the whole development to your raw developer
 
 ```sh
-apilaaa -i res -o stacked.dng --no-residual-surface   # halo + gradient only
-apilaaa -i res -o stacked.dng --no-flatten            # no correction at all
+./target/release/apilaaa -i res -o stacked.dng --no-stretch
 ```
+
+By default the output carries a per-channel black/white point rescale so the DNG
+looks reasonable the moment it opens. The data stays linear either way — the
+stretch is a rescale, not a curve — but `--no-stretch` keeps the native sensor
+scale, which is what you want when you intend to *measure* the result: comparing
+two runs numerically, reading the removed layer in sensor units, or feeding the
+file to a photometry tool.
+
+### Triage a night before committing to it
+
+```sh
+./target/release/apilaaa -i res -o test.dng --limit 40
+./target/release/apilaaa -i res -o test.dng --limit 40 --export-clean test_clean --export-window 1
+```
+
+`--limit 40` stops after the first forty files, which is enough to see the star
+count, whether the alignment locks, and what the defect model looks like.
+Adding `--export-window 1` on top removes the temporal denoising, the most
+expensive part of the export, so a preview sequence costs roughly one frame's
+work per frame.
+
+### Too few frames survive the selection
+
+If the run stops with `no frame passes the stack selection`, or the frame count
+that reaches the stack is far below what you shot, the two selection knobs are
+what to reach for:
+
+```sh
+# a night that drifts in brightness (moonrise, twilight, thin cloud)
+./target/release/apilaaa -i res -o stacked.dng --stack-sky-tolerance 2.5
+
+# a tracked framing that always has some horizon or trees in it
+./target/release/apilaaa -i res -o stacked.dng --stack-max-foreground 0.3
+```
+
+`--stack-sky-tolerance` widens the accepted sky-level band around the session
+median; `--stack-max-foreground` admits frames that contain foreground and masks
+those pixels out instead of dropping the frame. Both only change what is
+*averaged* — `--export-clean` exports rejected frames regardless, because a frame
+that is bad for averaging is usually fine in a moving sequence.
+
+### The alignment cannot find its stars
+
+```sh
+./target/release/apilaaa -i res -o stacked.dng --max-stars 80
+```
+
+`too few stars in the reference` means the first file, not the sequence, is the
+problem — it is the reference that defines the geometry. Raising `--max-stars`
+gives the triangle matching more candidates on a sparse or short-exposure field;
+lowering it speeds up matching on a dense one. If the reference frame itself is
+unusable (cloud, a plane crossing it, a mistimed first exposure), move it out of
+the directory rather than tuning around it.
+
+### Keep or erase the things that move
+
+Meteors, satellites and planes are preserved by default: the temporal window
+would otherwise average them away, so pixels that deviate from the combination
+by more than 4σ in elongated components are written back from the original
+frame.
+
+```sh
+# a meteor shower — the default, spelled out
+./target/release/apilaaa -i res -o stacked.dng --export-clean res_clean
+
+# an airport approach path you would rather not see
+./target/release/apilaaa -i res -o stacked.dng --export-clean res_clean --export-no-transients
+```
+
+### Export in sensor coordinates
+
+```sh
+./target/release/apilaaa -i res -o stacked.dng --export-clean res_raw --export-no-stabilize
+```
+
+Every frame keeps its own framing and full size, uncropped. Useful when you want
+to stabilize elsewhere, or to see the defect correction on its own without the
+alignment moving the picture underneath it. Temporal denoising is disabled with
+it, because the sliding window needs the frames to be registered.
+
+### When the model misbehaves
+
+Three knobs, in order of severity:
+
+```sh
+apilaaa -i res -o stacked.dng --scatter-comp 0          # halo removed, contrast not rescaled
+apilaaa -i res -o stacked.dng --no-residual-surface     # halo + gradient only
+apilaaa -i res -o stacked.dng --no-flatten              # no correction at all
+```
+
+`--scatter-comp 0` is the mildest: the veil is still subtracted, but the local
+contrast in the veiled area is left alone instead of being divided back up,
+which is the right call when the compensation starts amplifying noise near the
+corners. `--no-residual-surface` drops the surface, bands and spokes and keeps
+the parametric halo and gradient. `--no-flatten` turns the correction off
+entirely — and with it `--export-clean`, which refuses to run without a model.
 
 ## Options
 
@@ -214,6 +375,124 @@ apilaaa -i res -o stacked.dng --no-flatten            # no correction at all
 | `--fixed-search <PX>` | `64` | Maximum tripod drift searched for, in sensor pixels. |
 | `--fixed-anomaly <MODE>` | `coarse` | Freedom given to the per-frame anomaly: `coarse` (broad structure only), `none` (defect model alone), `full` (as in a tracked sequence — will eat part of a drifting Milky Way). |
 
+## Command reference
+
+Everything runnable in this repository, in one place: the build, the tool
+itself, the audit scripts and the diagnostic invocations. `apilaaa` below is
+shorthand for `./target/release/apilaaa`; the flags themselves are catalogued
+under [Options](#options).
+
+### Build and run
+
+| Command | What it does |
+|---|---|
+| `cargo build --release` | Builds the optimized binary at `target/release/apilaaa`. A debug build works but is roughly an order of magnitude slower, and the pipeline reads every frame twice. |
+| `cargo run --release -- -i res -o stacked.dng` | The same run without leaving Cargo; everything after `--` goes to the program. |
+| `./target/release/apilaaa --help` | The generated flag list with its defaults. The [Options](#options) tables above are its annotated form. |
+| `./target/release/apilaaa -i res -o stacked.dng 2>&1 \| tee run.log` | Keeps the narration. The console output is the run's record — see [Reading the console output](#reading-the-console-output). |
+
+### Picking the run
+
+| If you want to… | Command |
+|---|---|
+| Stack one tracked night | `apilaaa -i res -o stacked.dng` |
+| Stack **and** get the timelapse | `apilaaa -i res -o stacked.dng --export-clean res_clean` |
+| Work an untracked, fixed-tripod night | `apilaaa -i res -o trails.dng --fixed-tripod --export-clean res_clean` |
+| Check the run before spending the night on it | `apilaaa -i res -o test.dng --limit 40` |
+| Get a preview sequence fast | `apilaaa -i res -o test.dng --limit 40 --export-clean test_clean --export-window 1` |
+| Keep the native sensor scale | `apilaaa -i res -o stacked.dng --no-stretch` |
+| See what the correction removed | `apilaaa -i res -o stacked.dng --dump-correction layer.dng` |
+| Loosen the frame selection | `apilaaa -i res -o stacked.dng --stack-sky-tolerance 2.5 --stack-max-foreground 0.3` |
+| Back the correction off one stage | `apilaaa -i res -o stacked.dng --no-residual-surface` |
+| Turn the correction off entirely | `apilaaa -i res -o stacked.dng --no-flatten` |
+
+### Audit scripts
+
+The three scripts in `comparison/` are plain Python 3 with NumPy and Pillow.
+They parse the DNGs this tool writes directly — no raw developer in the loop —
+so what they show is the file itself rather than someone's development of it.
+They take positional arguments only, and they must stay together: `dng2png.py`
+is the reader the other two import.
+
+| Script | Invocation | Purpose |
+|---|---|---|
+| `dng2png.py` | `python3 dng2png.py IN.dng OUT.png [LO_PCT] [HI_PCT]` | Renders one DNG to PNG under a per-channel percentile stretch (defaults `0.5` and `99.7`, γ 0.5, 6× downsample). The quickest way to look at an output. |
+| `compare.py` | `python3 compare.py BEFORE.dng AFTER.dng OUT.png [LO_PCT] [HI_PCT] [DOWNSAMPLE] [LABEL_A] [LABEL_B]` | Two DNGs side by side under one identical stretch, labelled (defaults `1.0`, `99.5`, 4× downsample). Every image in the `comparison/` gallery is made with it. |
+| `audit.py` | `python3 audit.py LAYER.dng LAYER_PARAM.dng UNCORRECTED.dng CORRECTED.dng OUT.png LABEL` | Four panels: uncorrected stack, corrected stack, total removed layer, and the fine removed layer (`LAYER − LAYER_PARAM`) as a percentage of the sky level with grey at zero. All six arguments are required. |
+
+The audit run in full, in linear scale so the percentages mean something:
+
+```sh
+apilaaa -i res -o corrected.dng --no-stretch --dump-correction layer.dng
+apilaaa -i res -o uncorrected.dng --no-stretch --no-flatten
+apilaaa -i res -o /tmp/p.dng --no-stretch --no-residual-surface --dump-correction layer_param.dng
+cd comparison
+python3 audit.py ../layer.dng ../layer_param.dng ../uncorrected.dng ../corrected.dng out.png "surface v3"
+```
+
+See [Auditing the correction](#auditing-the-correction) for how to read the
+result. The gallery PNGs are not versioned — around 6 MB each — so regenerate
+the ones you want from your own run with `compare.py`.
+
+### Encoding the sequence
+
+`--export-clean` writes one `<name>_clean.dng` per frame. Develop them however
+you like, then hand the result to a video encoder:
+
+```sh
+ffmpeg -framerate 24 -pattern_type glob -i 'res_clean/*.jpg' \
+       -c:v libx264 -crf 16 -pix_fmt yuv420p timelapse.mp4
+```
+
+### Diagnostic runs
+
+Three environment variables expose the internals without changing a pixel of
+the output. Only their presence matters, except for `APILAAA_DEBUG_DIR`, whose
+value is the destination directory — it is created if it does not exist.
+
+```sh
+APILAAA_DEBUG=1 ./target/release/apilaaa -i res -o stacked.dng
+APILAAA_DEBUG_DIR=/tmp/dbg ./target/release/apilaaa -i res -o stacked.dng
+APILAAA_DEBUG_CORR=1 ./target/release/apilaaa -i res -o stacked.dng --limit 5
+```
+
+`APILAAA_DEBUG_CORR` prints a numeric map per frame, so keep it under
+`--limit`. What each variable dumps is described under
+[Diagnostics](#diagnostics) below.
+
+## How the flags interact
+
+The flags are not fully independent, and the run tells you when one of them has
+been overruled. The rules worth knowing before a long night:
+
+- **`--export-clean` needs the correction.** Combined with `--no-flatten` the
+  run stops immediately with `--export-clean requires the correction to be
+  enabled (drop --no-flatten)`. There is no export-only mode either: the stack
+  is the reference the deflickering matches against, so it is always computed.
+- **`--dump-correction` with `--no-flatten` is a warning, not an error.** There
+  is nothing to dump, so the run continues and prints
+  `--dump-correction ignored (correction disabled)`.
+- **`--export-window` is rounded up to the next odd number** and floored at
+  `1`; `2` behaves as `3`. `1` disables the temporal noise reduction.
+- **An unstabilized tracked export forces the window to `1`.** The sliding
+  window combines registered frames, so `--export-no-stabilize` on a tracked
+  sequence disables it whatever `--export-window` says. Under `--fixed-tripod`
+  the window is combined on the sky instead and survives.
+- **An untracked window needs stars.** On `--fixed-tripod` the window is
+  aligned on the sky, which requires a usable star fit in the reference; if
+  there are too few, the run warns that `--export-window will fall back to 1`.
+- **The `--fixed-*` flags require `--fixed-tripod`.** `--fixed-search`,
+  `--fixed-anomaly` and `--fixed-no-stabilize` are read only in untracked mode
+  and are ignored, silently, without it.
+- **`--stack-max-foreground` has two defaults**: `0` for a tracked sequence,
+  `1` under `--fixed-tripod`, where the landscape is part of the picture. And
+  it has a floor: when fewer than a fifth of the frames come in under the
+  limit, frames with foreground are admitted with a mask up to `0.6` anyway,
+  and the run says so.
+- **`--limit` cuts the file listing first.** Files are sorted by name, the
+  first one becomes the reference that defines the output geometry, and
+  `--limit N` keeps the first N — so it always includes the reference.
+
 ## Reading the console output
 
 The run narrates itself; every line is there to be checked rather than watched.
@@ -239,6 +518,16 @@ exporting 451 frames to res_clean (window 7 frames, stabilize=true, deflicker=tr
 exported 451 frames in 414.2s
 ```
 
+An untracked run replaces the star fit with the drift it measured, and names
+the frame it takes the export's levels from:
+
+```
+tripod drift: measured against the reference's landscape (18.4% of the frame), up to 64 px
+  [10/517] _DSC0010.ARW: 38 stars, drift (+1.43,-0.62) px, corr 0.81, sky 0.2908 in 1.61s
+  [11/517] _DSC0011.ARW: 37 stars, drift not measurable, identity, sky 0.2911 in 1.58s
+levels reference: _DSC0233.ARW (sky 0.2301, closest to the session median 0.2296) — the star-trail stack is not one
+```
+
 What to look at:
 
 - **`inliers`** per frame. A healthy fit sits well above the minimum of six. A
@@ -257,6 +546,12 @@ What to look at:
   frame is being ramped towards its natural version.
 - **`transients … px`** is how many pixels were rescued from the temporal
   combination — a meteor, a satellite, a plane.
+- **`drift` and `corr`**, on an untracked run, are the equivalent of `θ`/`t`
+  and `inliers`: the drift should stay small and evolve smoothly over the night
+  — legs settling, wind — and the correlation should sit well clear of the
+  `0.25` floor. A page of `drift not measurable, identity` means the landscape
+  is not being found, which on a genuinely tracked sequence means the mode is
+  wrong; see [Picking the wrong one](#picking-the-wrong-one).
 
 ## What it can achieve
 
@@ -529,14 +824,9 @@ bands, wedges towards the edges, the vignetting bowl. If a nebula-shaped patch
 appears in it, a stage is taking sky, and stage 05 in the gallery above is what
 that looks like when it happens.
 
-The full procedure, in linear scale so the numbers mean something:
-
-```sh
-apilaaa --no-stretch --dump-correction layer.dng
-apilaaa --no-stretch --no-residual-surface --dump-correction layer_param.dng
-cd comparison
-python3 audit.py layer.dng layer_param.dng uncorrected.dng corrected.dng out.png label
-```
+The full procedure is three runs and one script, spelled out under
+[Audit scripts](#audit-scripts); everything is done in linear scale, with
+`--no-stretch`, so the numbers mean something.
 
 `audit.py` lays out four panels: the uncorrected stack, the corrected stack, the
 total removed layer, and — bottom right — the **fine** removed layer, that is
