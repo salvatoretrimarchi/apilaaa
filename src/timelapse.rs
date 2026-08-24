@@ -237,18 +237,20 @@ pub fn combine_window_warped(
     cur: usize,
     w: usize,
     h: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<u8>) {
     let n = frames.len();
     assert!(n >= 1 && masks.len() == n && ts.len() == n && cur < n);
     let (wf, hf) = (w as f32, h as f32);
     let mut out = vec![0.0f32; w * h * 3];
-    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+    let mut used = vec![0u8; w * h];
+    out.par_chunks_mut(w * 3).zip(used.par_chunks_mut(w)).enumerate().for_each(|(y, (row, urow))| {
         let yf = y as f32;
         let mut buf = [[0.0f32; 64]; 3];
         for x in 0..w {
             let i = y * w + x;
             if masks[cur][i] != 0 {
                 row[x * 3..x * 3 + 3].copy_from_slice(&frames[cur][i * 3..i * 3 + 3]);
+                urow[x] = 1;
                 continue;
             }
             let xf = x as f32;
@@ -303,9 +305,10 @@ pub fn combine_window_warped(
                     frames[cur][i * 3 + c]
                 };
             }
+            urow[x] = m.min(255) as u8;
         }
     });
-    out
+    (out, used)
 }
 
 /// Ramp (frame sky level / session median) between the night-sky cleaning
@@ -326,6 +329,12 @@ const TRANSIENT_MIN_EXTENT: usize = 40;
 /// high-pass filter is about as wide as it is long, and taking those from the
 /// frame untouched is what put square patches into the export.
 const TRANSIENT_MIN_ELONGATION: f32 = 3.0;
+/// Fewest samples a pixel's temporal combination must have had for a
+/// transient to be worth rescuing there. Below the trimmed mean's own
+/// threshold of four the combination is a plain mean of two or three frames,
+/// noisy enough to be taken for a transient wherever the window loses
+/// coverage — which is the whole border of an untracked export.
+const TRANSIENT_MIN_SAMPLES: usize = 4;
 /// Radius (px) of the high-pass applied to the difference before the
 /// threshold: a trail is narrow; a smooth and extensive change of the sky
 /// between frames (twilight, horizon glow, a faint cloud passing) is not a
@@ -382,7 +391,14 @@ pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 /// those pixels the value from the original frame is used as is. Stars and
 /// hot pixels are static → difference ≈ 0 → they are left alone. Returns
 /// the number of preserved pixels.
-pub fn preserve_transients(cur: &[f32], combined: &mut [f32], fg: &[u8], w: usize, h: usize) -> usize {
+pub fn preserve_transients(
+    cur: &[f32],
+    combined: &mut [f32],
+    fg: &[u8],
+    used: Option<&[u8]>,
+    w: usize,
+    h: usize,
+) -> usize {
     let n = w * h;
     // Luminance difference and luminance of the combination (sky).
     let mut d = vec![0.0f32; n];
@@ -460,10 +476,18 @@ pub fn preserve_transients(cur: &[f32], combined: &mut [f32], fg: &[u8], w: usiz
     // exposure is always elongated; a star residue or noise is not).
     // Two tails: excess (bright trails) and deficit (dark moving occluders:
     // foreground, clouds) — in both cases the frame wins.
-    let mut mask: Vec<u8> = ds
-        .iter()
-        .zip(lum.iter())
-        .map(|(&v, &l)| ((v > thr_hi || v < thr_lo) && l >= dark_thr) as u8)
+    // Only where the trimmed mean actually ran. Towards the edges of an
+    // untracked export the neighbouring frames warp off the sensor, so a
+    // pixel there is left with two or three samples and its combination is
+    // both noisy and far from the frame — which reads as a transient, and
+    // turned whole strips along the border into raw frame pasted over the
+    // export. There is nothing to preserve where nothing was averaged away.
+    let mut mask: Vec<u8> = (0..n)
+        .map(|i| {
+            let enough = used.map_or(true, |u| u[i] as usize >= TRANSIENT_MIN_SAMPLES);
+            let v = ds[i];
+            (enough && (v > thr_hi || v < thr_lo) && lum[i] >= dark_thr) as u8
+        })
         .collect();
     drop(lum);
     {
@@ -816,14 +840,17 @@ pub fn export_sequence(
             .ok_or_else(|| anyhow!("frame {} is not in the buffer", next_emit))?;
         let cur: &[f32] = win[cur_k];
         let gain_txt = win_entries[cur_k].3.clone();
-        let mut img = match (&ts, win.len()) {
-            (_, 1) => cur.to_vec(),
-            (Some(ts), _) => combine_window_warped(&win, &wmasks, ts, cur_k, ow, oh),
-            (None, _) => combine_window(&win, &wmasks, cur_k),
+        let (mut img, used) = match (&ts, win.len()) {
+            (_, 1) => (cur.to_vec(), None),
+            (Some(ts), _) => {
+                let (v, u) = combine_window_warped(&win, &wmasks, ts, cur_k, ow, oh);
+                (v, Some(u))
+            }
+            (None, _) => (combine_window(&win, &wmasks, cur_k), None),
         };
         let mut kept_txt = String::new();
         if win.len() > 1 && opts.keep_transients {
-            let kept = preserve_transients(cur, &mut img, wmasks[cur_k], ow, oh);
+            let kept = preserve_transients(cur, &mut img, wmasks[cur_k], used.as_deref(), ow, oh);
             kept_txt = format!("  transients {} px", kept);
         }
         // Full dawn/twilight: blend with the natural version of the frame.

@@ -374,6 +374,10 @@ const FLAT_MIN_TRANSMISSION: f32 = 0.15;
 /// At 32 px per cell this is a few hundred pixels, far below the scale over
 /// which vignetting varies and far above the scale of the fit's own noise.
 const FLAT_SMOOTH_CELLS: usize = 6;
+/// Radial bins the channel ratios are collapsed onto (see
+/// `FlatField::colour_radial`). Few enough that no patch can survive them,
+/// enough to follow a falloff that parts with wavelength towards the edges.
+const FLAT_COLOUR_BINS: usize = 12;
 /// How far apart the two half-session fits may land before the field is
 /// judged not to have been measured, as a fraction of the field's own
 /// peak-to-trough. Relative rather than absolute: the question is whether the
@@ -507,33 +511,71 @@ impl FlatField {
             }
         }
         self.data = out;
-        self.make_achromatic();
+        self.colour_radial();
     }
 
-    /// Makes the field achromatic: the shape measured on green is used for
-    /// all three channels.
+    /// Restricts how the field may differ between channels to a radial
+    /// profile.
     ///
-    /// Each channel's slope is regressed against the *green* sky level, so
-    /// anything about how the sky's own colour changes as it brightens —
-    /// twilight and light pollution do not share a spectrum — lands in the
-    /// red and blue slopes as if the lens had put it there. The sky's colour
-    /// also varies across the frame, since the light dome sits to one side,
-    /// so what comes out is a correction that tints one part of the frame
-    /// against another. Measured on the untracked session, fitting the three
-    /// channels apart tripled the spread of the frames' colour ratios, from
-    /// 4.2% to 14.4% in R/G, while it was cutting the level error from 7.8%
-    /// to 2.2%; smoothing the ratios recovered only a third of that.
+    /// Two failures sit either side of this. Fitting each channel freely made
+    /// the correction invent colour: each slope is regressed against the
+    /// *green* sky level, so how the sky's own colour changes as it brightens
+    /// — twilight and light pollution do not share a spectrum — landed in the
+    /// red and blue slopes as if the lens had put it there, and since the
+    /// light dome sits to one side, it came out as patches tinting one part
+    /// of the frame against another: the frames' colour spread tripled, 4.2%
+    /// to 14.4% in R/G. Taking green's shape for all three killed that, but
+    /// left real chromatic vignetting uncorrected, and a lens does vignette
+    /// blue more than red: what remained was a colour pattern fixed to the
+    /// sensor, correlating 0.9 between frames taken far enough apart that the
+    /// sky had moved on.
     ///
-    /// A lens does vignette blue more than red, but that difference cannot be
-    /// separated here from the sky's own colour, and it is far smaller than
-    /// what the fit was claiming. Taking the green shape for all three leaves
-    /// real chromatic vignetting uncorrected — as it already was — and keeps
-    /// the correction from inventing colour of its own.
-    fn make_achromatic(&mut self) {
-        for i in 0..self.gw * self.gh {
-            let g = self.data[i * 3 + 1];
-            self.data[i * 3] = g;
-            self.data[i * 3 + 2] = g;
+    /// What separates the two is that chromatic vignetting is radial about
+    /// the optical axis, while what the free fit was picking up is not. So
+    /// the ratios to green are collapsed onto a radial profile: a handful of
+    /// degrees of freedom instead of one per cell, which is enough to follow
+    /// how transmission parts with wavelength towards the edges and far too
+    /// few to draw a patch anywhere.
+    fn colour_radial(&mut self) {
+        let (gw, gh) = (self.gw, self.gh);
+        let n = gw * gh;
+        let (cx, cy) = ((gw as f32 - 1.0) * 0.5, (gh as f32 - 1.0) * 0.5);
+        let r_max = (cx * cx + cy * cy).sqrt().max(1.0);
+        let nb = FLAT_COLOUR_BINS;
+        for c in [0usize, 2usize] {
+            // Median ratio to green per radial bin.
+            let mut bins: Vec<Vec<f32>> = vec![Vec::new(); nb];
+            for i in 0..n {
+                let g = self.data[i * 3 + 1];
+                if g.abs() <= 1e-6 { continue; }
+                let (x, y) = ((i % gw) as f32, (i / gw) as f32);
+                let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / r_max;
+                let b = ((r * nb as f32) as usize).min(nb - 1);
+                bins[b].push(self.data[i * 3 + c] / g);
+            }
+            let mut prof = vec![1.0f32; nb];
+            let mut last = 1.0f32;
+            for b in 0..nb {
+                if bins[b].len() >= 8 {
+                    last = median_inplace(&mut bins[b]);
+                }
+                prof[b] = last;
+            }
+            // A light three-point smoothing, so the profile carries no step.
+            let raw = prof.clone();
+            for b in 0..nb {
+                let lo = b.saturating_sub(1);
+                let hi = (b + 1).min(nb - 1);
+                prof[b] = (raw[lo] + raw[b] + raw[hi]) / 3.0;
+            }
+            for i in 0..n {
+                let (x, y) = ((i % gw) as f32, (i / gw) as f32);
+                let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / r_max * nb as f32 - 0.5;
+                let j = r.floor().clamp(0.0, nb as f32 - 2.0) as usize;
+                let t = (r - j as f32).clamp(0.0, 1.0);
+                let ratio = prof[j] * (1.0 - t) + prof[j + 1] * t;
+                self.data[i * 3 + c] = ratio * self.data[i * 3 + 1];
+            }
         }
     }
 
