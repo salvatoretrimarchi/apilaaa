@@ -320,6 +320,12 @@ const TRANSIENT_DILATE: usize = 2;
 /// Minimum extent (px, longer side of the box) of a connected component
 /// for it to be considered a real trail and not a star residue or noise.
 const TRANSIENT_MIN_EXTENT: usize = 40;
+/// Minimum ratio between a component's long and short axes, measured from
+/// its second moments. What the extent alone cannot tell apart: a meteor or a
+/// satellite is long and thin, while a patch of cloud or a blob left by the
+/// high-pass filter is about as wide as it is long, and taking those from the
+/// frame untouched is what put square patches into the export.
+const TRANSIENT_MIN_ELONGATION: f32 = 3.0;
 /// Radius (px) of the high-pass applied to the difference before the
 /// threshold: a trail is narrow; a smooth and extensive change of the sky
 /// between frames (twilight, horizon glow, a faint cloud passing) is not a
@@ -424,7 +430,18 @@ pub fn preserve_transients(cur: &[f32], combined: &mut [f32], fg: &[u8], w: usiz
     });
     drop(tmp);
     // High-pass: drop the smooth and extensive component of the difference.
-    let lp = box_blur(&ds, w, h, TRANSIENT_HP_RADIUS);
+    //
+    // Three box passes rather than one. A single box is square, so around a
+    // strong local excess its mean rises over the whole 2r+1 square and the
+    // difference goes negative across all of it — a square plateau that the
+    // deficit tail below then takes for a dark moving occluder, and that
+    // comes out of the export as a square patch of untouched frame. Three
+    // passes approximate a Gaussian, whose response is round and decays.
+    let lp = {
+        let mut b = box_blur(&ds, w, h, TRANSIENT_HP_RADIUS);
+        b = box_blur(&b, w, h, TRANSIENT_HP_RADIUS / 2);
+        box_blur(&b, w, h, TRANSIENT_HP_RADIUS / 2)
+    };
     ds.par_iter_mut().zip(lp.par_iter()).for_each(|(d, l)| *d -= *l);
     drop(lp);
     // Robust σ via MAD over a stratified sample.
@@ -474,8 +491,32 @@ pub fn preserve_transients(cur: &[f32], combined: &mut [f32], fg: &[u8], w: usiz
                     if mask[j] != 0 && !visited[j] { visited[j] = true; stack.push(j); }
                 }
             }
+            // Elongation from the second moments, so it does not depend on
+            // which way the trail runs: the bounding box alone calls a
+            // diagonal trail square and a square plateau elongated. A trail
+            // in a long exposure is long and thin whichever way it points; a
+            // blob left by the filter, or a patch of cloud, is not.
             let extent = (maxx - minx + 1).max(maxy - miny + 1);
-            if extent < TRANSIENT_MIN_EXTENT {
+            let elong = {
+                let cnt = comp.len() as f64;
+                let (mut sx, mut sy) = (0.0f64, 0.0f64);
+                for &i in &comp { sx += (i % w) as f64; sy += (i / w) as f64; }
+                let (mx, my) = (sx / cnt, sy / cnt);
+                let (mut cxx, mut cyy, mut cxy) = (0.0f64, 0.0f64, 0.0f64);
+                for &i in &comp {
+                    let dx = (i % w) as f64 - mx;
+                    let dy = (i / w) as f64 - my;
+                    cxx += dx * dx; cyy += dy * dy; cxy += dx * dy;
+                }
+                cxx /= cnt; cyy /= cnt; cxy /= cnt;
+                let tr = cxx + cyy;
+                let det = cxx * cyy - cxy * cxy;
+                let disc = (0.25 * tr * tr - det).max(0.0).sqrt();
+                let l1 = 0.5 * tr + disc;
+                let l2 = (0.5 * tr - disc).max(1e-9);
+                (l1 / l2).sqrt() as f32
+            };
+            if extent < TRANSIENT_MIN_EXTENT || elong < TRANSIENT_MIN_ELONGATION {
                 for &i in &comp { mask[i] = 0; }
             }
         }
