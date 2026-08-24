@@ -355,6 +355,332 @@ pub fn sky_level(map: &BgMap, mask: &CellMask) -> f32 {
 /// below it the cell is filled in from its neighbours.
 const TM_MIN_SAMPLES: usize = 5;
 
+/// Minimum spread of the session's sky level, brightest over darkest, for the
+/// multiplicative field to be identifiable at all. Below it the regression
+/// has no lever and the field is left flat.
+const FLAT_MIN_LEVER: f32 = 1.25;
+/// Minimum number of frames a cell needs before its own slope is trusted.
+const FLAT_MIN_SAMPLES: usize = 12;
+/// IRLS passes of the per-cell regression, and the rejection threshold in
+/// MAD units: what sits above it is sky that drifted through the cell, or a
+/// cloud, not the lens.
+const FLAT_IRLS_PASSES: usize = 3;
+const FLAT_IRLS_K: f32 = 2.5;
+/// Floor on the transmission used as a divisor. Dividing by the field lifts
+/// the corners, and with them their noise, by the inverse of the
+/// transmission; this caps that gain so a badly measured cell cannot blow up.
+const FLAT_MIN_TRANSMISSION: f32 = 0.15;
+/// Radius, in map cells, the field is averaged over (see `FlatField::smooth`).
+/// At 32 px per cell this is a few hundred pixels, far below the scale over
+/// which vignetting varies and far above the scale of the fit's own noise.
+const FLAT_SMOOTH_CELLS: usize = 6;
+/// How far apart the two half-session fits may land before the field is
+/// judged not to have been measured, as a fraction of the field's own
+/// peak-to-trough. Relative rather than absolute: the question is whether the
+/// field is pinned down to a small part of what it claims, and that question
+/// has the same answer whichever half of a session is used to ask it, which
+/// an absolute limit did not.
+const FLAT_MAX_DISAGREEMENT: f32 = 0.20;
+
+/// The multiplicative field of the camera (vignetting), measured from the
+/// sequence itself.
+///
+/// Vignetting attenuates whatever light reaches the sensor, so it acts as a
+/// factor on the sky, not as a quantity subtracted from it. A model that
+/// subtracts a fixed amount is only right at the sky level it was fitted at:
+/// on a frame at r× that level it leaves (r−1)× the dome behind, positive
+/// above the median and negative below, which is what puts a bright dome on
+/// the early frames of a night and a dark hole on the late ones.
+///
+/// What makes it measurable is that the sky level moves over a session —
+/// twilight fading, light pollution changing, the moon — while the lens does
+/// not. Writing each cell of the background map across the session as
+///
+/// ```text
+/// map_i(t) = V_i · S(t) + A_i
+/// ```
+///
+/// separates the two by regression: the slope `V_i` is what scales with the
+/// light (the lens), the intercept `A_i` is what does not (stray light from a
+/// fixed source, amplifier glow). No assumption is needed about where the
+/// optical axis sits or what shape the falloff has, which is what the
+/// parametric fit could not settle on its own.
+///
+/// Sky structure does not leak into the slope. On an untracked sequence the
+/// sky rotates through each cell, so its contribution is uncorrelated with
+/// `S(t)` and the robust regression averages it out; on a tracked one it is
+/// steady in time while the light pollution varies, so it lands in the
+/// intercept. Either way it stays out of `V`.
+#[derive(Clone)]
+pub struct FlatField {
+    pub gw: usize,
+    pub gh: usize,
+    pub block: usize,
+    /// Slope per cell and channel, normalised to a median of 1.
+    pub data: Vec<f32>,
+    /// Brightest over darkest sky level among the frames used: the lever the
+    /// regression had to work with.
+    pub lever: f32,
+    /// Median distance, per cell, between the fits of two interleaved halves
+    /// of the session. This is what decides whether the field is used.
+    pub disagreement: f32,
+    /// False when the session gave no lever to measure with: the field is
+    /// all ones and nothing is divided out.
+    pub usable: bool,
+}
+
+impl FlatField {
+    /// A field that changes nothing.
+    pub fn flat(gw: usize, gh: usize, block: usize, lever: f32) -> Self {
+        FlatField {
+            gw, gh, block,
+            data: vec![1.0; gw * gh * 3],
+            lever,
+            disagreement: f32::INFINITY,
+            usable: false,
+        }
+    }
+
+    /// Transmission at a pixel, bilinear between cell centres.
+    pub fn eval(&self, x: f32, y: f32) -> [f32; 3] {
+        let b = self.block as f32;
+        let fx = ((x - b * 0.5) / b).clamp(0.0, (self.gw - 1) as f32 - 1e-3);
+        let fy = ((y - b * 0.5) / b).clamp(0.0, (self.gh - 1) as f32 - 1e-3);
+        let (i0, j0) = (fx.floor() as usize, fy.floor() as usize);
+        let (tx, ty) = (fx - i0 as f32, fy - j0 as f32);
+        let idx = |i: usize, j: usize| (j * self.gw + i) * 3;
+        let (a, bb, c, d) = (idx(i0, j0), idx(i0 + 1, j0), idx(i0, j0 + 1), idx(i0 + 1, j0 + 1));
+        let mut out = [1.0f32; 3];
+        for k in 0..3 {
+            out[k] = self.data[a + k] * (1.0 - tx) * (1.0 - ty)
+                + self.data[bb + k] * tx * (1.0 - ty)
+                + self.data[c + k] * (1.0 - tx) * ty
+                + self.data[d + k] * tx * ty;
+        }
+        out
+    }
+
+    /// Smooths the field over `FLAT_SMOOTH_CELLS`.
+    ///
+    /// Every cell's slope is fitted on its own, so each carries its own
+    /// estimation noise, and a lens cannot change transmission from one 32 px
+    /// block to the next. Left unsmoothed that noise goes straight into the
+    /// correction and, being independent per channel, comes out as colour
+    /// mottling. The vignetting itself runs over thousands of pixels, so
+    /// averaging over a few hundred costs it nothing.
+    fn smooth(&mut self) {
+        let (gw, gh) = (self.gw, self.gh);
+        let r = FLAT_SMOOTH_CELLS;
+        let mut out = vec![1.0f32; gw * gh * 3];
+        // The window is padded by edge replication rather than truncated.
+        // Truncating averages fewer cells near the border, and over the steep
+        // falloff that lives exactly there it pulls the estimate towards the
+        // interior: the field comes out too shallow at the edge, too little
+        // is added back, and the frame keeps a dark rim.
+        let (pw, ph) = (gw + 2 * r, gh + 2 * r);
+        for c in 0..3 {
+            let mut pad = vec![0.0f64; pw * ph];
+            for y in 0..ph {
+                let sy = (y as isize - r as isize).clamp(0, gh as isize - 1) as usize;
+                for x in 0..pw {
+                    let sx = (x as isize - r as isize).clamp(0, gw as isize - 1) as usize;
+                    pad[y * pw + x] = self.data[(sy * gw + sx) * 3 + c] as f64;
+                }
+            }
+            let mut integ = vec![0.0f64; (pw + 1) * (ph + 1)];
+            for y in 0..ph {
+                for x in 0..pw {
+                    integ[(y + 1) * (pw + 1) + x + 1] = pad[y * pw + x]
+                        + integ[y * (pw + 1) + x + 1]
+                        + integ[(y + 1) * (pw + 1) + x]
+                        - integ[y * (pw + 1) + x];
+                }
+            }
+            let cnt = ((2 * r + 1) * (2 * r + 1)) as f64;
+            for y in 0..gh {
+                for x in 0..gw {
+                    let si = |xx: usize, yy: usize| integ[yy * (pw + 1) + xx];
+                    let sum = si(x + 2 * r + 1, y + 2 * r + 1) - si(x, y + 2 * r + 1)
+                        - si(x + 2 * r + 1, y) + si(x, y);
+                    out[(y * gw + x) * 3 + c] = (sum / cnt) as f32;
+                }
+            }
+        }
+        self.data = out;
+    }
+
+    /// Adds back the deficit the field implies at this map's own sky level,
+    /// in place, so everything fitted downstream sees the same frame that
+    /// `clean_frame` will produce. The two must agree: the model is fitted on
+    /// these maps and then subtracted from those pixels.
+    pub fn apply_map(&self, map: &mut BgMap) {
+        if !self.usable { return; }
+        let n = map.gw * map.gh;
+        let mut level = [0.0f32; 3];
+        for c in 0..3 {
+            let mut v: Vec<f32> = (0..n)
+                .filter(|&i| map.is_valid(i))
+                .map(|i| map.data[i * 3 + c])
+                .collect();
+            if !v.is_empty() { level[c] = median_inplace(&mut v); }
+        }
+        for i in 0..n {
+            for c in 0..3 {
+                let t = self.data[i * 3 + c].clamp(FLAT_MIN_TRANSMISSION, 1.0 / FLAT_MIN_TRANSMISSION);
+                map.data[i * 3 + c] += (1.0 - t) * level[c];
+            }
+        }
+    }
+
+    /// Peak-to-trough of the green slope, as a percentage.
+    pub fn report(&self) -> String {
+        if !self.usable {
+            return format!(
+                "not measurable (sky level spread ×{:.2}, half-session fits differ by {:.0}% of the field, limit {:.0}%) — nothing divided out",
+                self.lever, 100.0 * self.disagreement, 100.0 * FLAT_MAX_DISAGREEMENT
+            );
+        }
+        let g: Vec<f32> = (0..self.gw * self.gh).map(|i| self.data[i * 3 + 1]).collect();
+        let mn = g.iter().cloned().fold(f32::MAX, f32::min);
+        let mx = g.iter().cloned().fold(f32::MIN, f32::max);
+        format!(
+            "measured over a sky level spread of ×{:.2} (half-session fits agree to {:.0}% of the field): transmission {:.1}%–100.0% of centre",
+            self.lever, 100.0 * self.disagreement, 100.0 * mn / mx
+        )
+    }
+}
+
+/// Fits `FlatField` by regressing every map cell against its frame's sky
+/// level. `levels` is the sky level of each map, in the same order.
+///
+/// The field is only handed back for use once it has been shown to be
+/// reproducible: it is fitted again on two interleaved halves of the same
+/// frames and the two are compared cell by cell. Both halves span the whole
+/// session, so what the comparison measures is whether the session gave
+/// enough of a lever to determine the field at all, not how the night
+/// evolved. Where it did not — too little movement in the sky level — the
+/// field is left flat and nothing is divided out, because dividing by a
+/// badly measured field adds error of its own.
+pub fn fit_flat_field(maps: &[BgMap], masks: &[CellMask], levels: &[f32]) -> FlatField {
+    assert!(maps.len() == masks.len() && maps.len() == levels.len());
+    let (gw, gh, block) = (maps[0].gw, maps[0].gh, maps[0].block);
+    let lever = {
+        let mut v: Vec<f32> = levels.iter().cloned().filter(|l| *l > 0.0).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if v.len() < 2 { 1.0 } else { v[v.len() - 1] / v[0].max(1e-9) }
+    };
+    if maps.len() < 2 * FLAT_MIN_SAMPLES || lever < FLAT_MIN_LEVER {
+        return FlatField::flat(gw, gh, block, lever);
+    }
+
+    let full = fit_slopes(maps, masks, levels, 1, 0);
+    let half_a = fit_slopes(maps, masks, levels, 2, 0);
+    let half_b = fit_slopes(maps, masks, levels, 2, 1);
+    let n = gw * gh;
+    let mut d: Vec<f32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, b) = (half_a[i * 3 + 1], half_b[i * 3 + 1]);
+        if a.is_finite() && b.is_finite() {
+            d.push((a - b).abs());
+        }
+    }
+    let spread = {
+        let g: Vec<f32> = (0..n).map(|i| full[i * 3 + 1]).collect();
+        let mn = g.iter().cloned().fold(f32::MAX, f32::min);
+        let mx = g.iter().cloned().fold(f32::MIN, f32::max);
+        mx - mn
+    };
+    let disagreement = if d.len() < n / 4 || spread <= 1e-6 {
+        f32::INFINITY
+    } else {
+        median_inplace(&mut d) / spread
+    };
+
+    let mut field = FlatField { gw, gh, block, data: full, lever, disagreement, usable: false };
+    field.usable = disagreement <= FLAT_MAX_DISAGREEMENT;
+    if field.usable { field.smooth(); }
+    field
+}
+
+/// Per-cell slopes over every `step`-th frame starting at `offset`,
+/// normalised per channel to a median of 1. Cells the regression cannot
+/// settle come back as 1, which changes nothing.
+fn fit_slopes(
+    maps: &[BgMap],
+    masks: &[CellMask],
+    levels: &[f32],
+    step: usize,
+    offset: usize,
+) -> Vec<f32> {
+    let (gw, gh) = (maps[0].gw, maps[0].gh);
+    let n = gw * gh;
+    let sel: Vec<usize> = (offset..maps.len()).step_by(step).collect();
+    let slopes: Vec<[f32; 3]> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut out = [f32::NAN; 3];
+            for c in 0..3 {
+                let mut xs: Vec<f32> = Vec::with_capacity(sel.len());
+                let mut ys: Vec<f32> = Vec::with_capacity(sel.len());
+                for &f in &sel {
+                    let m = &maps[f];
+                    if !m.is_valid(i) || masks[f].data[i] || levels[f] <= 0.0 { continue; }
+                    xs.push(levels[f]);
+                    ys.push(m.data[i * 3 + c]);
+                }
+                if xs.len() < FLAT_MIN_SAMPLES { continue; }
+                // Straight least squares, then a few reweighted passes so a
+                // cloud or the Milky Way drifting through does not set the
+                // slope.
+                let mut w = vec![1.0f32; xs.len()];
+                let mut slope = f32::NAN;
+                for pass in 0..FLAT_IRLS_PASSES {
+                    let sw: f32 = w.iter().sum();
+                    if sw <= 0.0 { break; }
+                    let mx: f32 = xs.iter().zip(&w).map(|(x, w)| x * w).sum::<f32>() / sw;
+                    let my: f32 = ys.iter().zip(&w).map(|(y, w)| y * w).sum::<f32>() / sw;
+                    let mut sxy = 0.0f32;
+                    let mut sxx = 0.0f32;
+                    for k in 0..xs.len() {
+                        let dx = xs[k] - mx;
+                        sxy += w[k] * dx * (ys[k] - my);
+                        sxx += w[k] * dx * dx;
+                    }
+                    if sxx <= 1e-12 { break; }
+                    slope = sxy / sxx;
+                    let inter = my - slope * mx;
+                    if pass + 1 == FLAT_IRLS_PASSES { break; }
+                    let mut res: Vec<f32> =
+                        (0..xs.len()).map(|k| (ys[k] - (slope * xs[k] + inter)).abs()).collect();
+                    let mad = median_inplace(&mut res).max(1e-9);
+                    for k in 0..xs.len() {
+                        let r = (ys[k] - (slope * xs[k] + inter)).abs();
+                        w[k] = if r <= FLAT_IRLS_K * mad { 1.0 } else { 0.0 };
+                    }
+                }
+                if slope.is_finite() && slope > 0.0 { out[c] = slope; }
+            }
+            out
+        })
+        .collect();
+
+    // Normalise each channel to a median of 1: only the shape of the field
+    // matters, its overall level belongs to the exposure.
+    let mut data = vec![1.0f32; n * 3];
+    for c in 0..3 {
+        let mut v: Vec<f32> = slopes.iter().filter_map(|s| {
+            if s[c].is_finite() { Some(s[c]) } else { None }
+        }).collect();
+        if v.len() < n / 4 { continue; }
+        let med = median_inplace(&mut v).max(1e-9);
+        for i in 0..n {
+            let s = slopes[i][c];
+            data[i * 3 + c] = if s.is_finite() { (s / med).clamp(0.05, 20.0) } else { 1.0 };
+        }
+    }
+    data
+}
+
 /// Cell-by-cell temporal median ignoring, in every frame, the foreground
 /// cells. Cells with fewer than `TM_MIN_SAMPLES` samples (always occluded)
 /// are filled in iteratively with the mean of their valid neighbours. Also
@@ -455,6 +781,11 @@ pub struct GlareModel {
     pub pedestal: [f32; 3],
     /// Robust residual (MAD of the fit) per channel — diagnostic.
     pub residual_mad: [f32; 3],
+    /// The camera's multiplicative field (see `FlatField`), divided out
+    /// before the additive terms below are subtracted. It travels inside the
+    /// model because it is part of the same optical description and reaches
+    /// every place the model already reaches.
+    pub flat: Option<FlatField>,
     /// "Lower envelope" residual surface (see `fit_residual_surface`);
     /// None if disabled.
     pub surface: Option<Surface>,
@@ -1394,6 +1725,7 @@ impl GlareModel {
             r_full: full_radius(cx, cy, map.gw * map.block, map.gh * map.block),
             pedestal: [0.0; 3],
             residual_mad: [0.0; 3],
+            flat: None,
             surface: None,
             surface_coarse: None,
             lines: None,
@@ -1608,6 +1940,18 @@ pub fn correction_layer(
 pub fn clean_frame(model: &GlareModel, frame: &Frame, extra: Option<&FrameCorr>, clamp: bool, scatter_comp: f32) -> Vec<f32> {
     let w = frame.width;
     let wb = frame.wb;
+    // Sky level this frame's deficit is measured against: its own, so the
+    // correction follows the night instead of being fixed at the level the
+    // model was fitted at.
+    let flat_level = match (&model.flat, extra) {
+        (Some(_), Some(e)) => [
+            model.pedestal[0] * e.level_ratio,
+            model.pedestal[1] * e.level_ratio,
+            model.pedestal[2] * e.level_ratio,
+        ],
+        (Some(_), None) => model.pedestal,
+        (None, _) => [0.0; 3],
+    };
     let mut out = vec![0.0f32; frame.rgb.len()];
     let model_block_half = extra.map_or(0.0, |e| e.k_lp.step * 0.5);
     out.par_chunks_mut(w * 3)
@@ -1644,8 +1988,23 @@ pub fn clean_frame(model: &GlareModel, frame: &Frame, extra: Option<&FrameCorr>,
                             - e.pedestal[c];
                     }
                 }
+                // The field is applied as the deficit it implies at this
+                // frame's own sky level, not as a division. Dividing is the
+                // exact inverse of what the lens did, but it scales the noise
+                // with the signal and the corners of this lens pass 27% of
+                // the centre, so it multiplies their noise by nearly four —
+                // measured on the test session, it visibly coarsened a stack
+                // whose level error it had otherwise halved. The error that
+                // put a bright dome on the early frames and a hole in the
+                // late ones is one of level, and subtracting the deficit
+                // removes it just as well while leaving the noise alone.
+                let fl = model.flat.as_ref().map(|f| f.eval(xf, yf));
                 for c in 0..3 {
-                    let mut v = src[x * 3 + c] * wb[c] - k[c];
+                    let deficit = fl.map_or(0.0, |f| {
+                        (1.0 - f[c].clamp(FLAT_MIN_TRANSMISSION, 1.0 / FLAT_MIN_TRANSMISSION))
+                            * flat_level[c]
+                    });
+                    let mut v = src[x * 3 + c] * wb[c] + deficit - k[c];
                     if cg[c] != 1.0 {
                         v = model.pedestal[c] + (v - model.pedestal[c]) * cg[c];
                     }

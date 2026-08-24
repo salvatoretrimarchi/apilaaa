@@ -671,6 +671,37 @@ fn main() -> Result<()> {
     // Defect model: (masked) temporal median of the maps of the selected
     // frames.
     // ---------------------------------------------------------------
+    // The camera's multiplicative field, measured before anything additive
+    // is fitted: what scales with the sky level is the lens, and dividing it
+    // out is right at every level, which subtracting a fixed amount is not.
+    // Every map is divided by it so the model that follows only has to
+    // account for what is genuinely added to the frame.
+    // Only where the sky sweeps across the sensor. Separating a field fixed
+    // to the sensor from the structure of the sky needs the two to move with
+    // respect to each other, and a tracked mount exists precisely to stop
+    // that: there the regression absorbs the sky instead, reproducibly enough
+    // to pass every self-consistency check and still be wrong. Measured on
+    // the tracked test session, dividing by the field took the stack's radial
+    // residual from 0.56% to 4.65%.
+    let flat = if !untracked {
+        flatten::FlatField::flat(1, 1, flatten::BLOCK, 1.0)
+    } else {
+        let sel: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_stack).collect();
+        let maps: Vec<flatten::BgMap> = sel.iter().map(|f| f.bg.clone()).collect();
+        let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.mask.clone()).collect();
+        let levels: Vec<f32> = sel.iter().map(|f| f.level).collect();
+        flatten::fit_flat_field(&maps, &masks, &levels)
+    };
+    if untracked {
+        println!("flat field: {}", flat.report());
+    }
+    if flat.usable {
+        for f in infos.iter_mut() {
+            flat.apply_map(&mut f.bg);
+            f.level = flatten::sky_level(&f.bg, &f.mask);
+        }
+    }
+
     let stack_infos: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_stack).collect();
     let stack_transforms: Vec<Similarity> = stack_infos.iter().map(|f| f.m).collect();
     // Fits model + median map over a set of frames.
@@ -692,7 +723,8 @@ fn main() -> Result<()> {
         }
         drop(maps);
         drop(masks);
-        let model = flatten::GlareModel::fit(&bg, w_ref, h_ref, !args.no_residual_surface);
+        let mut model = flatten::GlareModel::fit(&bg, w_ref, h_ref, !args.no_residual_surface);
+        model.flat = if flat.usable { Some(flat.clone()) } else { None };
         println!("glare/gradient [{label}]: {}", model.report());
         if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
             flatten::debug_dump(&bg, &model, &Path::new(&dir).join(label))?;
@@ -835,6 +867,35 @@ fn main() -> Result<()> {
     }
     let stretch = if args.no_stretch {
         None
+    } else if let (true, Some((bg_med, model))) = (untracked, &stack_model) {
+        // The stack of an untracked session is a star-trail image, and its
+        // own percentiles cannot set its levels: a star lands on any given
+        // pixel in only a few frames, so the mean divides its flux by the
+        // length of the session and the high percentile taken as white falls
+        // back onto the sky. The window then collapses to about the width of
+        // the noise — measured at 11% of the sky level on the test session —
+        // and throws every residual of a per cent across a fifth of the
+        // display range, which is what made a correctly flattened stack look
+        // like it was full of defects. The levels come instead from one
+        // representative frame, the same one and for the same reason the
+        // export already uses.
+        let rep = infos
+            .iter()
+            .filter(|f| f.in_stack)
+            .min_by(|a, b| {
+                let d = |f: &FrameInfo| (f.level - med_level).abs();
+                d(a).partial_cmp(&d(b)).unwrap()
+            })
+            .ok_or_else(|| anyhow!("no frame available as the stack's levels reference"))?;
+        println!(
+            "stretch from {} (sky {:.4}, closest to the session median {:.4}) — a star-trail stack cannot set its own levels",
+            paths[rep.idx].file_name().unwrap().to_string_lossy(), rep.level, med_level
+        );
+        let frame = raw::load(&paths[rep.idx])
+            .with_context(|| format!("loading the stack's levels reference {}", paths[rep.idx].display()))?;
+        let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.mask), anomaly);
+        let img = flatten::clean_frame(model, &frame, Some(&fc), true, args.scatter_comp);
+        Some(output::analyze_stretch(&img))
     } else {
         println!("stretch analysis over the balanced stack ({}×{})", out_w, out_h);
         Some(output::analyze_stretch(&out))
