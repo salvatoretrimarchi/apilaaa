@@ -421,8 +421,12 @@ fn main() -> Result<()> {
                             String::from(if args.fixed_no_stabilize { "identity" } else { "drift not measurable, identity" }),
                         ),
                     };
+                    let structure = flatten::sky_structure(&bg, Some(&mask));
                     infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers: n_stars, export: true });
                     aligned += 1;
+                    if std::env::var_os("APILAAA_DEBUG_SKY").is_some() {
+                        println!("  SKYSTRUCT {} {:.4} {:.2}", idx + 1, level, structure);
+                    }
                     println!(
                         "  [{}/{}] {}: {} stars, {}, sky {:.4} in {:.2}s",
                         idx + 1,
