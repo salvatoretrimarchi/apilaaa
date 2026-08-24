@@ -730,43 +730,6 @@ fn fit_slopes(
     data
 }
 
-/// How much extended structure a frame's sky carries, beyond the smooth
-/// instrumental background.
-///
-/// A smooth `poly3 + radial` background is fitted to the frame's own map and
-/// what stands *above* it is measured: the gap between the 95th percentile
-/// and the median of the residual, as a percentage of the sky level. Stars do
-/// not register, since a map cell is a clipped median over 32x32 px. The
-/// Milky Way does, and so does any nebulosity or thin cloud.
-///
-/// The point of measuring it is that a frame whose sky is flat apart from
-/// stars shows the instrument and nothing else, so it is the honest place to
-/// measure the background from. Fitting the model on the session median
-/// instead lets whatever sat in a given part of the sensor for most of the
-/// night — the Milky Way, on a fixed tripod — be taken for part of the
-/// instrument and subtracted from every frame.
-///
-/// The MAD of the fit's own residual will not do for this: that fit is
-/// robust, so it rejects the very structure being looked for.
-pub fn sky_structure(map: &BgMap, mask: Option<&CellMask>) -> f32 {
-    let n = map.gw * map.gh;
-    let (w, h) = (map.gw * map.block, map.gh * map.block);
-    let fit = fit_channel(map, 1, w as f32 * 0.5, h as f32 * 0.5, (map.block * 2) as f32);
-    let mut res: Vec<f32> = Vec::with_capacity(n);
-    let mut lv: Vec<f32> = Vec::with_capacity(n);
-    for i in 0..n {
-        if !map.is_valid(i) || mask.map_or(false, |m| m.data[i]) { continue; }
-        res.push(map.data[i * 3 + 1] - fit.eval_cell(i, (map.block * 2) as f32));
-        lv.push(map.data[i * 3 + 1]);
-    }
-    if res.len() < 16 { return 0.0; }
-    let level = median_inplace(&mut lv).max(1e-9);
-    res.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = res[res.len() / 2];
-    let p95 = res[(res.len() * 95 / 100).min(res.len() - 1)];
-    100.0 * (p95 - p50) / level
-}
-
 /// Cell-by-cell temporal median ignoring, in every frame, the foreground
 /// cells. Cells with fewer than `TM_MIN_SAMPLES` samples (always occluded)
 /// are filled in iteratively with the mean of their valid neighbours. Also
