@@ -64,6 +64,15 @@ struct Args {
     #[arg(long, value_name = "DNG")]
     dump_correction: Option<PathBuf>,
 
+    /// Skip the stack: do not load, clean and average the selected frames,
+    /// and write no output DNG. Only the crop is still worked out, from the
+    /// frames' geometry alone, because `--export-clean` needs it. Requires
+    /// `--export-clean` (there would otherwise be nothing to produce) and
+    /// `--fixed-tripod`: on a tracked sequence the stack is what every
+    /// exported frame is levelled against, and there is no substitute for it.
+    #[arg(long)]
+    no_stack: bool,
+
     /// Directory to export the clean timelapse sequence to: every aligned
     /// frame (including the ones excluded from the stack) with the defect
     /// model + its own gradient and horizon glow subtracted, stabilized to
@@ -179,6 +188,14 @@ impl From<AnomalyArg> for AnomalyMode {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.no_stack {
+        if args.export_clean.is_none() {
+            return Err(anyhow!("--no-stack requires --export-clean: without either one the run would produce nothing"));
+        }
+        if !args.fixed_tripod {
+            return Err(anyhow!("--no-stack requires --fixed-tripod: on a tracked sequence the stack is the reference every exported frame is levelled against"));
+        }
+    }
     let mut paths = list_arw(&args.input)?;
     if let Some(n) = args.limit {
         paths.truncate(n);
@@ -759,7 +776,19 @@ fn main() -> Result<()> {
     // aligned, skipping the foreground pixels.
     // ---------------------------------------------------------------
     let mut acc = stack::Accumulator::new(w_ref, h_ref);
-    {
+    if args.no_stack {
+        // Only the geometry, which is all `--export-clean` needs from this
+        // pass: no frame is loaded, demosaiced or cleaned here.
+        let ts = Instant::now();
+        for info in &stack_infos {
+            acc.add_coverage(w_ref, h_ref, &info.m);
+        }
+        println!(
+            "no stack: coverage of {} frames only, in {:.1}s",
+            stack_infos.len(),
+            ts.elapsed().as_secs_f32()
+        );
+    } else {
         let ts = Instant::now();
         let n_stack = stack_infos.len();
         println!(
@@ -837,7 +866,12 @@ fn main() -> Result<()> {
     let corr = stack_model
         .as_ref()
         .map(|(_, m)| flatten::CorrGrid::build(m, &stack_transforms, acc.width, acc.height));
-    let (out, out_w, out_h) = acc.finalize_cropped(None);
+    let (out, out_w, out_h) = if args.no_stack {
+        let (x0, y0, x1, y1) = acc.valid_bounds();
+        (Vec::new(), x1 - x0, y1 - y0)
+    } else {
+        acc.finalize_cropped(None)
+    };
     if out_w != acc.width || out_h != acc.height {
         println!(
             "crop from drift: {}×{} → {}×{} (−{} px height, −{} px width)",
@@ -845,7 +879,7 @@ fn main() -> Result<()> {
             acc.height - out_h, acc.width - out_w
         );
     }
-    {
+    if !args.no_stack {
         let (x0, y0, _, _) = acc.valid_bounds();
         let mut holes = 0usize;
         let mut min_count = f32::MAX;
@@ -865,7 +899,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    let stretch = if args.no_stretch {
+    let stretch = if args.no_stretch || args.no_stack {
         None
     } else if let (true, Some((bg_med, model))) = (untracked, &stack_model) {
         // The stack of an untracked session is a star-trail image, and its
@@ -900,8 +934,12 @@ fn main() -> Result<()> {
         println!("stretch analysis over the balanced stack ({}×{})", out_w, out_h);
         Some(output::analyze_stretch(&out))
     };
-    output::write_dng(&args.output, &out, out_w, out_h, &camera_model, stretch)?;
-    println!("DNG written: {}", args.output.display());
+    if args.no_stack {
+        println!("no stack written (--no-stack); crop {}×{}", out_w, out_h);
+    } else {
+        output::write_dng(&args.output, &out, out_w, out_h, &camera_model, stretch)?;
+        println!("DNG written: {}", args.output.display());
+    }
 
     // Photographic metadata of the source RAW, written natively into every
     // DNG we produce: camera, lens, focal length, aperture, exposure, ISO
@@ -918,7 +956,7 @@ fn main() -> Result<()> {
             None
         }
     };
-    if let Some(e) = &src_exif {
+    if let (Some(e), false) = (&src_exif, args.no_stack) {
         exif::embed(&args.output, e)
             .with_context(|| format!("writing EXIF into {}", args.output.display()))?;
     }
@@ -938,12 +976,14 @@ fn main() -> Result<()> {
         }
     }
 
-    print!("copying MakerNotes + XMP + ICC from {}... ", paths[0].file_name().unwrap().to_string_lossy());
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    match output::copy_metadata(&paths[0], &args.output) {
-        Ok(()) => println!("ok"),
-        Err(e) => println!("WARNING: {e:#} — the DNG keeps the EXIF written natively, without MakerNotes/XMP"),
+    if !args.no_stack {
+        print!("copying MakerNotes + XMP + ICC from {}... ", paths[0].file_name().unwrap().to_string_lossy());
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        match output::copy_metadata(&paths[0], &args.output) {
+            Ok(()) => println!("ok"),
+            Err(e) => println!("WARNING: {e:#} — the DNG keeps the EXIF written natively, without MakerNotes/XMP"),
+        }
     }
 
     if let Some(dir) = &args.export_clean {

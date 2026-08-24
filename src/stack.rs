@@ -117,6 +117,35 @@ impl Accumulator {
         }
     }
 
+    /// Geometric coverage of one frame, with no pixel data involved.
+    ///
+    /// `cover` only records which pixels a frame's sensor reaches, which
+    /// depends on its transform and its size and nothing else. Accumulating
+    /// it on its own is what lets the valid crop be settled without loading,
+    /// demosaicing and cleaning every frame, when the stack itself is not
+    /// wanted.
+    pub fn add_coverage(&mut self, fw: usize, fh: usize, m: &Similarity) {
+        let (w, h) = (self.width, self.height);
+        let (fwf, fhf) = (fw as f32, fh as f32);
+        let rows: Vec<(usize, Vec<bool>)> = (0..h)
+            .into_par_iter()
+            .map(|y| {
+                let mut inside = vec![false; w];
+                for x in 0..w {
+                    let (qx, qy) = m.apply(x as f32, y as f32);
+                    inside[x] = qx >= 0.0 && qy >= 0.0 && qx < fwf - 1.0 && qy < fhf - 1.0;
+                }
+                (y, inside)
+            })
+            .collect();
+        for (y, inside) in rows {
+            let off = y * w;
+            for x in 0..w {
+                if inside[x] { self.cover[off + x] += 1; }
+            }
+        }
+    }
+
     /// Largest axis-aligned rectangle within which **every** pixel was
     /// geometrically covered by the maximum number of aligned frames
     /// (occluded by foreground or not). Returns (x0, y0, x1, y1) with
