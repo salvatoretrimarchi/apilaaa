@@ -58,8 +58,6 @@ becomes a star-trail image, which is what averaging a fixed sequence means.
   ICC. If it is missing the run warns and the native EXIF stays.
 - Linux is the tested platform. The RAM planner reads `/proc/meminfo` and falls
   back to a conservative 4 GiB assumption elsewhere.
-- Optional, for the audit scripts in `comparison/`: Python 3 with NumPy and
-  Pillow.
 
 ## Build
 
@@ -406,33 +404,29 @@ under [Options](#options).
 | Back the correction off one stage | `apilaaa -i res -o stacked.dng --no-residual-surface` |
 | Turn the correction off entirely | `apilaaa -i res -o stacked.dng --no-flatten` |
 
-### Audit scripts
+### Auditing an output
 
-The three scripts in `comparison/` are plain Python 3 with NumPy and Pillow.
-They parse the DNGs this tool writes directly — no raw developer in the loop —
-so what they show is the file itself rather than someone's development of it.
-They take positional arguments only, and they must stay together: `dng2png.py`
-is the reader the other two import.
-
-| Script | Invocation | Purpose |
-|---|---|---|
-| `dng2png.py` | `python3 dng2png.py IN.dng OUT.png [LO_PCT] [HI_PCT]` | Renders one DNG to PNG under a per-channel percentile stretch (defaults `0.5` and `99.7`, γ 0.5, 6× downsample). The quickest way to look at an output. |
-| `compare.py` | `python3 compare.py BEFORE.dng AFTER.dng OUT.png [LO_PCT] [HI_PCT] [DOWNSAMPLE] [LABEL_A] [LABEL_B]` | Two DNGs side by side under one identical stretch, labelled (defaults `1.0`, `99.5`, 4× downsample). Every image in the `comparison/` gallery is made with it. |
-| `audit.py` | `python3 audit.py LAYER.dng LAYER_PARAM.dng UNCORRECTED.dng CORRECTED.dng OUT.png LABEL` | Four panels: uncorrected stack, corrected stack, total removed layer, and the fine removed layer (`LAYER − LAYER_PARAM`) as a percentage of the sky level with grey at zero. All six arguments are required. |
-
-The audit run in full, in linear scale so the percentages mean something:
+The DNGs this tool writes are ordinary linear DNGs, so an audit needs nothing
+beyond the tool itself and whatever raw developer you already use. Run the same
+session three ways, in linear scale so the differences stay in the units the
+correction works in:
 
 ```sh
-apilaaa -i res -o corrected.dng --no-stretch --dump-correction layer.dng
+apilaaa -i res -o corrected.dng   --no-stretch --dump-correction layer.dng
 apilaaa -i res -o uncorrected.dng --no-stretch --no-flatten
-apilaaa -i res -o /tmp/p.dng --no-stretch --no-residual-surface --dump-correction layer_param.dng
-cd comparison
-python3 audit.py ../layer.dng ../layer_param.dng ../uncorrected.dng ../corrected.dng out.png "surface v3"
+apilaaa -i res -o /tmp/p.dng      --no-stretch --no-residual-surface \
+        --dump-correction layer_param.dng
 ```
 
+`layer.dng` is everything the correction removed. `layer_param.dng` is what the
+parametric stage alone removed, so `layer − layer_param` is the residual
+surface's own contribution. Opening the four under one identical stretch is
+what tells a defect from a piece of sky: anything in the removed layer that
+looks like structure — a dark nebula, a dust lane — is the correction reaching
+too far.
+
 See [Auditing the correction](#auditing-the-correction) for how to read the
-result. The gallery PNGs are not versioned — around 6 MB each — so regenerate
-the ones you want from your own run with `compare.py`.
+result.
 
 ### Encoding the sequence
 
@@ -555,42 +549,29 @@ What to look at:
 
 ## What it can achieve
 
-`comparison/` holds a stage-by-stage record of the correction being built,
-generated with the scripts in that directory over real output DNGs. Each image
-is a strict before/after: the previous stage on the left, the new one on the
-right, **both stretched identically** (percentile 0.5–99.8) so the comparison is
-honest rather than flattering.
+The correction was built one stage at a time, and every stage was measured
+against the one before it on real output DNGs: the previous stage on the left,
+the new one on the right, **both stretched identically** (percentile 0.5–99.8)
+so the comparison is honest rather than flattering. What each stage bought, and
+what one of them cost, is the table below.
 
-The images themselves are **not versioned** — around 6 MB each — so a fresh
-clone gets the scripts, the sidecars and the table below, and the images are
-regenerated locally from your own output DNGs with the commands at the end of
-this section.
-
-| # | Image | What the stage does, and what the pair proves |
+| # | Stage | What it does, and what the before/after proves |
 |---|---|---|
-| 01 | `01_flatten_poly3_radial.png` | No correction → parametric model. `poly3(x, y)` for the light-pollution gradient, a free radial profile about a *searched* optical axis for the halo, pupil ring and vignetting, plus `cos2θ`/`cos4θ` harmonics for non-circular vignetting from a hood or filter holder. The bowl and the halo go; the Milky Way stays, because it is rejected as an outlier by the robust fit. |
-| 02 | `02_superficie_residual_bordes.png` | Adds the lower-envelope residual surface at the edges: horizontal bands and flare wedges that no radial model can describe. |
-| 03 | `03_superficie_fina_64px.png` | Surface nodes tightened from 192 px to 64 px, solved matrix-free by conjugate gradient. The thin lines and wedges that survived at the edges disappear. |
-| 04 | `04_bandas_filas_y_radios.png` | Fixed 1D patterns whose geometry belongs to the hardware: sensor row banding (per-row median, high-passed in `y`) and flare spokes (per-angle median about the optical centre, high-passed in `θ`), both subtracted over the whole frame. |
-| 05 | `05_capa_eliminada.png` | **A failure, kept on purpose.** The audit of stage 04 shows the edge surface eating a real, extensive dark patch — a dark nebula, top centre. This is exactly what the audit exists to catch. |
-| 06 | `06_superficie_pasa_banda.png`, `06_auditoria_capa_eliminada.png` | The fix: the edge surface becomes band-pass (fine − Gaussian σ=150 px), so only fine structure is removed and extensive sky patches survive. The dark patch is gone from the removed layer. |
-| 07 | `07_gruesa_simetrica_espejo.png`, `07_auditoria_capa_eliminada.png` | From the coarse component, only the part **shared with its own left/right mirror** about the optical axis is subtracted. System defects are symmetric about the lens; the sky is not. Wide edge wedges removed, dark nebula intact. |
-| 08 | `08_horizonte_stack.png`, `08_frames_gradiente_propio.png` | Horizon glow: a robust 1D profile along the direction of maximum residual gradient, searched over the full 0–360° so nothing is assumed about where the horizon sits in the framing. On export, every frame additionally gets its own `poly3` gradient for varying light pollution and twilight, pedestal preserved. |
-| 09 | `09_timelapse_estable.png` | The sequence as a sequence: same similarity and same crop as the stack, a 7-frame sliding trimmed mean, per-channel deflickering against the stack. Frames 1, 61 and 121 come out identical in tone, brightness and framing. |
-| 10 | `10_transitorios_conservados.png` | Transients survive the trimmed mean: `|frame − combination| > 4σ` over elongated connected components of ≥ 40 px, restored verbatim from the original frame. `_DSC0335` and `_DSC0406` keep their trails. |
+| 01 | Parametric model | No correction → parametric model. `poly3(x, y)` for the light-pollution gradient, a free radial profile about a *searched* optical axis for the halo, pupil ring and vignetting, plus `cos2θ`/`cos4θ` harmonics for non-circular vignetting from a hood or filter holder. The bowl and the halo go; the Milky Way stays, because it is rejected as an outlier by the robust fit. |
+| 02 | Residual edge surface | Adds the lower-envelope residual surface at the edges: horizontal bands and flare wedges that no radial model can describe. |
+| 03 | Fine surface, 64 px nodes | Surface nodes tightened from 192 px to 64 px, solved matrix-free by conjugate gradient. The thin lines and wedges that survived at the edges disappear. |
+| 04 | Row bands and flare spokes | Fixed 1D patterns whose geometry belongs to the hardware: sensor row banding (per-row median, high-passed in `y`) and flare spokes (per-angle median about the optical centre, high-passed in `θ`), both subtracted over the whole frame. |
+| 05 | Audit of stage 04 | **A failure, kept on purpose.** The audit of stage 04 shows the edge surface eating a real, extensive dark patch — a dark nebula, top centre. This is exactly what the audit exists to catch. |
+| 06 | Band-pass edge surface | The fix: the edge surface becomes band-pass (fine − Gaussian σ=150 px), so only fine structure is removed and extensive sky patches survive. The dark patch is gone from the removed layer. |
+| 07 | Mirror-symmetric coarse component | From the coarse component, only the part **shared with its own left/right mirror** about the optical axis is subtracted. System defects are symmetric about the lens; the sky is not. Wide edge wedges removed, dark nebula intact. |
+| 08 | Horizon glow | Horizon glow: a robust 1D profile along the direction of maximum residual gradient, searched over the full 0–360° so nothing is assumed about where the horizon sits in the framing. On export, every frame additionally gets its own `poly3` gradient for varying light pollution and twilight, pedestal preserved. |
+| 09 | Stable timelapse | The sequence as a sequence: same similarity and same crop as the stack, a 7-frame sliding trimmed mean, per-channel deflickering against the stack. Frames 1, 61 and 121 come out identical in tone, brightness and framing. |
+| 10 | Transients preserved | Transients survive the trimmed mean: `|frame − combination| > 4σ` over elongated connected components of ≥ 40 px, restored verbatim from the original frame. `_DSC0335` and `_DSC0406` keep their trails. |
 
 The arc of that table is the point. Stages 01–04 remove more and more; stage 05
 proves one of them went too far; stages 06–07 make the correction *narrower* on
 purpose, trading a little defect removal for the certainty that no sky is being
 taken. That trade is the whole design.
-
-Regenerate any of them yourself:
-
-```sh
-cd comparison
-python3 compare.py before.dng after.dng out.png 0.5 99.8 4 "label A" "label B"
-python3 audit.py layer.dng layer_param.dng uncorrected.dng corrected.dng out.png label
-```
 
 ### A real session, measured
 
@@ -821,18 +802,18 @@ be compared side by side in a developer.
 
 A healthy removed layer shows **defect geometry only** — radial lines, horizontal
 bands, wedges towards the edges, the vignetting bowl. If a nebula-shaped patch
-appears in it, a stage is taking sky, and stage 05 in the gallery above is what
+appears in it, a stage is taking sky, and stage 05 in the table above is what
 that looks like when it happens.
 
-The full procedure is three runs and one script, spelled out under
-[Audit scripts](#audit-scripts); everything is done in linear scale, with
-`--no-stretch`, so the numbers mean something.
+The full procedure is the three runs spelled out under
+[Auditing an output](#auditing-an-output); everything is done in linear scale,
+with `--no-stretch`, so the numbers mean something.
 
-`audit.py` lays out four panels: the uncorrected stack, the corrected stack, the
-total removed layer, and — bottom right — the **fine** removed layer, that is
-`layer − layer_param`, exactly what the surface, bands and spokes took, rendered
-as a percentage of the sky level with grey at zero. That last panel is the one
-that decides whether a change was an improvement.
+Four things are worth putting side by side: the uncorrected stack, the corrected
+stack, the total removed layer, and the **fine** removed layer, that is
+`layer − layer_param`, exactly what the surface, bands and spokes took, read as
+a percentage of the sky level with zero at mid grey. That last one is what
+decides whether a change was an improvement.
 
 Safety knobs when a scene defeats the model: `--no-residual-surface` restricts
 the correction to halo and gradient, `--no-flatten` disables it entirely, and the
@@ -883,7 +864,6 @@ export cost at the price of the noise reduction.
 | `src/output.rs` | Stretch analysis, linear DNG writing, metadata copying through exiftool. |
 | `src/exif.rs` | Native EXIF: reads the source RAW's identifying and photographic tags and writes them into the DNG by relocating its IFD0. |
 | `src/timelapse.rs` | Clean sequence export: stabilization, deflickering, temporal denoising, transient preservation, dawn ramp. |
-| `comparison/` | Stage-by-stage before/after evidence and the audit scripts (the images themselves are not versioned; regenerate them locally). |
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
 
 ## Limits
