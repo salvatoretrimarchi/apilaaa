@@ -1,3 +1,4 @@
+use crate::say;
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::io::BufWriter;
@@ -173,7 +174,7 @@ fn write_dng_impl(
     ];
     if verbose && stretch.is_some() {
         let pct = |c: usize| 100.0 * blacks[c] / white[c];
-        println!(
+        say!(
             "stretch: white=R {:.6} G {:.6} B {:.6}  blacks=R {:.6} G {:.6} B {:.6} ({:.1}% / {:.1}% / {:.1}% of the range)",
             white[0], white[1], white[2],
             blacks[0], blacks[1], blacks[2],

@@ -53,6 +53,7 @@
 //! The pedestal (median sky level) is preserved: only the spatial variation
 //! is removed, not the absolute level.
 
+use crate::say;
 use crate::align::Similarity;
 use crate::raw::Frame;
 use rayon::prelude::*;
@@ -2487,7 +2488,7 @@ pub fn fit_frame_corr_ex(
                 out += "\n";
             }
         }
-        print!("{out}");
+        say!("{}", out.trim_end());
     }
     FrameCorr { surface, pedestal, range, gain, k_lp, dome, k_mean, level_ratio }
 }

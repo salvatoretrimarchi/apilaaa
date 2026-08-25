@@ -7,6 +7,7 @@ mod raw;
 mod stack;
 mod stars;
 mod timelapse;
+mod ui;
 
 use crate::align::Similarity;
 use crate::flatten::AnomalyMode;
@@ -22,47 +23,47 @@ use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "RAW stacker with translation and rotation correction")]
-struct Args {
+pub struct Args {
     /// Directory holding the input RAW files (.ARW)
     #[arg(short, long, default_value = "res")]
-    input: PathBuf,
+    pub input: PathBuf,
 
     /// Output DNG file
     #[arg(short, long, default_value = "stacked.dng")]
-    output: PathBuf,
+    pub output: PathBuf,
 
     /// Maximum number of stars used per frame for alignment
     #[arg(long, default_value_t = 40)]
-    max_stars: usize,
+    pub max_stars: usize,
 
     /// Process at most N frames (useful for testing)
     #[arg(long)]
-    limit: Option<usize>,
+    pub limit: Option<usize>,
 
     /// Disable the automatic histogram stretch; keeps the native sensor
     /// scale (useful if you want to do the whole development in darktable
     /// without any prior gain).
     #[arg(long)]
-    no_stretch: bool,
+    pub no_stretch: bool,
 
     /// Disable the automatic removal of the lens halo/glare and of the
     /// background gradient (plane model + radial profile in sensor
     /// coordinates, see `flatten`). Enabled by default.
     #[arg(long)]
-    no_flatten: bool,
+    pub no_flatten: bool,
 
     /// Disable the second correction stage (lower-envelope residual surface
     /// that removes non-radial bands/wedges); keeps only the parametric
     /// halo + gradient model.
     #[arg(long)]
-    no_residual_surface: bool,
+    pub no_residual_surface: bool,
 
     /// Also write a DNG holding the **removed layer** (halo + gradient +
     /// surface + bands/radii, averaged like the stack, plus the sky
     /// pedestal) with the same crop and stretch as the output, so you can
     /// check in the developer that only defect was removed, not sky.
     #[arg(long, value_name = "DNG")]
-    dump_correction: Option<PathBuf>,
+    pub dump_correction: Option<PathBuf>,
 
     /// Skip the stack: do not load, clean and average the selected frames,
     /// and write no output DNG. Only the crop is still worked out, from the
@@ -71,7 +72,7 @@ struct Args {
     /// `--fixed-tripod`: on a tracked sequence the stack is what every
     /// exported frame is levelled against, and there is no substitute for it.
     #[arg(long)]
-    no_stack: bool,
+    pub no_stack: bool,
 
     /// Directory to export the clean timelapse sequence to: every aligned
     /// frame (including the ones excluded from the stack) with the defect
@@ -86,28 +87,28 @@ struct Args {
     /// are taken from a representative frame instead. Requires the
     /// correction to be enabled.
     #[arg(long, value_name = "DIR")]
-    export_clean: Option<PathBuf>,
+    pub export_clean: Option<PathBuf>,
 
     /// Frames in the temporal window used to reduce noise in --export-clean
     /// (odd; 1 = no reduction). Noise ≈ /√(N−2).
     #[arg(long, default_value_t = 7, value_name = "N")]
-    export_window: usize,
+    pub export_window: usize,
 
     /// Do not stabilize in --export-clean (exports in sensor coordinates,
     /// uncropped; temporal noise reduction is disabled too because it
     /// requires aligned frames).
     #[arg(long)]
-    export_no_stabilize: bool,
+    pub export_no_stabilize: bool,
 
     /// Do not apply deflickering in --export-clean.
     #[arg(long)]
-    export_no_deflicker: bool,
+    pub export_no_deflicker: bool,
 
     /// In --export-clean, do NOT preserve transients (meteors, satellites,
     /// planes) over the temporal combination. By default they are kept with
     /// the value from the original frame.
     #[arg(long)]
-    export_no_transients: bool,
+    pub export_no_transients: bool,
 
     /// In --export-clean, do NOT treat the sky covered by cloud as the
     /// frame's own. By default a cloud is marked like the foreground is: it
@@ -118,21 +119,21 @@ struct Args {
     /// brighter than any star and takes over the high percentile the
     /// deflickering reads the star cores from).
     #[arg(long)]
-    export_no_cloud_guard: bool,
+    pub export_no_cloud_guard: bool,
 
     /// Contrast compensation in the halo/veil areas (β): the veil light is
     /// scattered light missing from the structure of that area; after
     /// subtracting the veil, the deviation from the sky is rescaled by
     /// 1/(1 − β·veil/sky) to match the contrast at the centre. 0 = off.
     #[arg(long, default_value_t = 1.0, value_name = "BETA")]
-    scatter_comp: f32,
+    pub scatter_comp: f32,
 
     /// Frame selection for the stack: frames whose sky level (median of the
     /// background without foreground) falls outside [median/F, median·F] of
     /// the session (twilight, clouds, moon) are excluded. Excluded frames
     /// are still exported by --export-clean (unless the sky is saturated).
     #[arg(long, default_value_t = 1.6, value_name = "F")]
-    stack_sky_tolerance: f32,
+    pub stack_sky_tolerance: f32,
 
     /// Frame selection for the stack: frames with more than this fraction of
     /// the frame taken up by foreground (trees, horizon) are excluded.
@@ -145,7 +146,7 @@ struct Args {
     /// default is 1: the landscape is in every frame and is part of the
     /// picture, so it is never a reason to drop a frame.
     #[arg(long, value_name = "FRAC")]
-    stack_max_foreground: Option<f32>,
+    pub stack_max_foreground: Option<f32>,
 
     /// **Untracked sequence**: the camera stayed fixed on a tripod for the
     /// whole timelapse, so the landscape is stationary on the sensor and
@@ -157,17 +158,17 @@ struct Args {
     /// out as a star-trail image, which is what averaging an untracked
     /// sequence means.
     #[arg(long)]
-    fixed_tripod: bool,
+    pub fixed_tripod: bool,
 
     /// In --fixed-tripod, do not measure the tripod drift: assume the
     /// camera was perfectly still and export in sensor coordinates,
     /// uncropped.
     #[arg(long)]
-    fixed_no_stabilize: bool,
+    pub fixed_no_stabilize: bool,
 
     /// In --fixed-tripod, maximum tripod drift searched for, in sensor px.
     #[arg(long, default_value_t = 64, value_name = "PX")]
-    fixed_search: usize,
+    pub fixed_search: usize,
 
     /// In --fixed-tripod, how much freedom the per-frame temporal anomaly
     /// is given. `coarse` (default) lets it follow only structure far
@@ -176,12 +177,12 @@ struct Args {
     /// alone; `full` uses the same surface as a tracked sequence, which on
     /// an untracked one will subtract part of the drifting Milky Way.
     #[arg(long, default_value = "coarse", value_name = "MODE")]
-    fixed_anomaly: AnomalyArg,
+    pub fixed_anomaly: AnomalyArg,
 }
 
 /// CLI spelling of `flatten::AnomalyMode`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
-enum AnomalyArg {
+pub enum AnomalyArg {
     Coarse,
     None,
     Full,
@@ -198,7 +199,64 @@ impl From<AnomalyArg> for AnomalyMode {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    // No arguments at all and a terminal on both ends: the setup screen,
+    // then the dashboard. Anything else — one flag, a pipe, a CI job — is
+    // the command line as it always was, reporting line by line.
+    let (args, interactive) = if ui::should_prompt() {
+        match ui::wizard::run()? {
+            Some(a) => (a, true),
+            None => return Ok(()),
+        }
+    } else {
+        (Args::parse(), false)
+    };
+    if interactive {
+        ui::start_dashboard(summary(&args));
+    }
+    let result = run(args);
+    ui::shutdown(result.as_ref().err().map(|e| format!("{e:#}")));
+    result
+}
+
+/// What the dashboard states about the run at the top of the screen: the
+/// handful of settings that decide what comes out of it.
+fn summary(args: &Args) -> Vec<(String, String)> {
+    let mut v = vec![
+        (String::from("input"), args.input.display().to_string()),
+        (
+            String::from("mode"),
+            String::from(if args.fixed_tripod { "untracked (fixed tripod)" } else { "tracked" }),
+        ),
+    ];
+    v.push((
+        String::from("output"),
+        if args.no_stack { String::from("none (--no-stack)") } else { args.output.display().to_string() },
+    ));
+    v.push((
+        String::from("export"),
+        match &args.export_clean {
+            Some(d) => format!("{} (window {})", d.display(), args.export_window),
+            None => String::from("off"),
+        },
+    ));
+    v.push((String::from("frames"), String::from("counting...")));
+    v.push((
+        String::from("clean"),
+        String::from(if args.no_flatten { "off (--no-flatten)" } else { "halo + gradient" }),
+    ));
+    v
+}
+
+/// Stops between frames when the dashboard's user asks for it. Never in the
+/// middle of writing one: a half-written DNG is worse than no DNG.
+fn check_abort() -> Result<()> {
+    if ui::aborted() {
+        return Err(anyhow!("stopped by the user"));
+    }
+    Ok(())
+}
+
+fn run(args: Args) -> Result<()> {
     if args.no_stack {
         if args.export_clean.is_none() {
             return Err(anyhow!("--no-stack requires --export-clean: without either one the run would produce nothing"));
@@ -214,12 +272,13 @@ fn main() -> Result<()> {
     if paths.is_empty() {
         return Err(anyhow!("no ARW found in {}", args.input.display()));
     }
-    println!("found {} frames", paths.len());
+    say!("found {} frames", paths.len());
+    ui::head("frames", paths.len().to_string());
 
     let t0 = Instant::now();
     let ref_frame = raw::load(&paths[0])
         .with_context(|| format!("loading reference {}", paths[0].display()))?;
-    println!(
+    say!(
         "reference: {} ({} x {}) in {:.2}s",
         paths[0].file_name().unwrap().to_string_lossy(),
         ref_frame.width,
@@ -237,12 +296,12 @@ fn main() -> Result<()> {
 
     let lum_ref = raw::luminance(&ref_frame);
     let stars_ref = stars::detect(&lum_ref, ref_frame.width, ref_frame.height, args.max_stars);
-    println!("stars in reference: {}", stars_ref.len());
+    say!("stars in reference: {}", stars_ref.len());
     if stars_ref.len() < 6 {
         if !untracked {
             return Err(anyhow!("too few stars in the reference ({}) — check exposure or max_stars", stars_ref.len()));
         }
-        println!("  WARNING: too few stars for the sky-aligned temporal window; --export-window will fall back to 1");
+        say!("  WARNING: too few stars for the sky-aligned temporal window; --export-window will fall back to 1");
     }
 
     let camera_model = ref_frame.camera.clone();
@@ -266,12 +325,12 @@ fn main() -> Result<()> {
         if untracked && !args.fixed_no_stabilize {
             let tpl = fixed::template(&lum_ref, w_ref, h_ref, &mask);
             if tpl.usable {
-                println!(
+                say!(
                     "tripod drift: measured against the reference's landscape ({:.1}% of the frame), up to {} px",
                     100.0 * tpl.fg_fraction, args.fixed_search
                 );
             } else {
-                println!(
+                say!(
                     "tripod drift: NOT measurable (landscape {:.1}% of the frame) — every frame is left at identity",
                     100.0 * tpl.fg_fraction
                 );
@@ -282,7 +341,7 @@ fn main() -> Result<()> {
     }
     drop(lum_ref);
     drop(ref_frame);
-    println!("  [1/{}] reference: foreground {:.1}%", paths.len(), 100.0 * infos[0].mask.fraction());
+    say!("  [1/{}] reference: foreground {:.1}%", paths.len(), 100.0 * infos[0].mask.fraction());
     // Untracked sequence: each frame's stars, kept so the chain of
     // consecutive fits can be built after this pass.
     let mut star_lists: Vec<Vec<stars::Star>> = vec![Vec::new(); paths.len()];
@@ -292,7 +351,7 @@ fn main() -> Result<()> {
 
     let n_cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let (n_workers, chan_cap, ram_info) = compute_pipeline_params(w_ref, h_ref, n_cpus, paths.len() - 1);
-    println!(
+    say!(
         "pipeline: {} workers, up to {} frames in flight (total RAM {:.1} GiB, budget 80% = {:.1} GiB, {:.0} MiB/frame)",
         n_workers,
         n_workers + chan_cap + 1,
@@ -305,6 +364,9 @@ fn main() -> Result<()> {
     let max_stars = args.max_stars;
     let next_idx = AtomicUsize::new(1);
     let (tx, rx) = sync_channel::<Msg>(chan_cap);
+    ui::phase("pass 1: alignment and background maps");
+    ui::task_begin("align", "align", total as u64);
+    ui::task_set("align", 1);
 
     let mut aligned = 1usize;
     let mut skipped = 0usize;
@@ -324,7 +386,7 @@ fn main() -> Result<()> {
             s.spawn(move || {
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= total {
+                    if idx >= total || ui::aborted() {
                         break;
                     }
                     let p = &paths[idx];
@@ -386,9 +448,10 @@ fn main() -> Result<()> {
         drop(tx);
 
         while let Ok(msg) = rx.recv() {
+            ui::task_add("align", 1);
             match msg {
                 Msg::LoadErr { idx, error } => {
-                    println!(
+                    say!(
                         "  [{}/{}] {}: LOAD FAILED {error}",
                         idx + 1,
                         total,
@@ -397,7 +460,7 @@ fn main() -> Result<()> {
                     skipped += 1;
                 }
                 Msg::DimMismatch { idx } => {
-                    println!(
+                    say!(
                         "  [{}/{}] {}: different dimensions, skipped",
                         idx + 1,
                         total,
@@ -434,7 +497,7 @@ fn main() -> Result<()> {
                     };
                     infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers: n_stars, export: true });
                     aligned += 1;
-                    println!(
+                    say!(
                         "  [{}/{}] {}: {} stars, {}, sky {:.4} in {:.2}s",
                         idx + 1,
                         total,
@@ -458,7 +521,7 @@ fn main() -> Result<()> {
                             let fg = mask.fraction();
                             infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers, export: true });
                             aligned += 1;
-                            println!(
+                            say!(
                                 "  [{}/{}] {}: {} stars, {} inliers, θ={:.3}°, t=({:.2},{:.2}), sky {:.4}{} in {:.2}s",
                                 idx + 1,
                                 total,
@@ -475,7 +538,7 @@ fn main() -> Result<()> {
                         }
                         (fit, Some((bg, mask, level))) => {
                             let inl = fit.map_or(0, |(_, i)| i);
-                            println!(
+                            say!(
                                 "  [{}/{}] {}: NOT ALIGNED ({} stars detected, {} inliers); will try to interpolate the neighbours' alignment",
                                 idx + 1,
                                 total,
@@ -512,7 +575,7 @@ fn main() -> Result<()> {
             let dev = corner_deviation(&infos[k].m, &pred, w_ref, h_ref);
             if dev > ALIGN_MAX_DEV_PX {
                 bad.push(k);
-                println!(
+                say!(
                     "  {}: implausible alignment (departs {:.1} px from the neighbours' drift, {} inliers) — replaced by interpolation, out of the stack",
                     paths[infos[k].idx].file_name().unwrap().to_string_lossy(), dev, infos[k].inliers
                 );
@@ -530,7 +593,7 @@ fn main() -> Result<()> {
         for mut f in pending.drain(..) {
             match predict_transform(&infos, f.idx, None) {
                 Some(m) => {
-                    println!(
+                    say!(
                         "  {}: alignment interpolated from the neighbours (θ={:.3}°, t=({:.2},{:.2})); exported, out of the stack",
                         paths[f.idx].file_name().unwrap().to_string_lossy(), m.angle_deg(), m.tx, m.ty
                     );
@@ -539,7 +602,7 @@ fn main() -> Result<()> {
                     n_fixed += 1;
                 }
                 None => {
-                    println!(
+                    say!(
                         "  {}: no aligned neighbours nearby, skipped",
                         paths[f.idx].file_name().unwrap().to_string_lossy()
                     );
@@ -549,17 +612,22 @@ fn main() -> Result<()> {
         }
         infos.sort_by_key(|f| f.idx);
         if n_fixed > 0 {
-            println!("  {} frames with interpolated alignment", n_fixed);
+            say!("  {} frames with interpolated alignment", n_fixed);
         }
     }
 
-    println!(
+    say!(
         "aligned: {}  interpolated: {}  skipped: {}  time: {:.1}s",
         aligned,
         infos.iter().filter(|f| !f.aligned).count(),
         skipped,
         t0.elapsed().as_secs_f32()
     );
+    ui::task_end(
+        "align",
+        format!("{aligned} aligned, {skipped} skipped, {:.1}s", t0.elapsed().as_secs_f32()),
+    );
+    check_abort()?;
 
     // ---------------------------------------------------------------
     // Untracked sequence: one landscape for the whole session, and the
@@ -571,7 +639,7 @@ fn main() -> Result<()> {
             let masks: Vec<flatten::CellMask> = infos.iter().map(|f| f.mask.clone()).collect();
             let consensus = flatten::consensus_mask(&masks);
             drop(masks);
-            println!(
+            say!(
                 "landscape: single consensus mask over {} frames, {:.1}% of the frame",
                 infos.len(),
                 100.0 * consensus.fraction()
@@ -608,12 +676,12 @@ fn main() -> Result<()> {
                 *m
             };
             let ok = links.iter().filter(|l| l.is_some()).count();
-            println!(
+            say!(
                 "sky chain: {} of {} consecutive links fitted in {:.1}s (median residual {:.2} px)",
                 ok, links.len(), tc.elapsed().as_secs_f32(), med_rms
             );
             if med_rms > 1.0 {
-                println!(
+                say!(
                     "  WARNING: a similarity already leaves {:.2} px between consecutive frames — the sky's motion is not one at this field of view or interval. Lower --export-window (or set it to 1) if the stars come out soft.",
                     med_rms
                 );
@@ -647,7 +715,7 @@ fn main() -> Result<()> {
             .max(0.0);
         let n_clear = infos.iter().filter(|f| f.aligned && f.mask.fraction() <= max_fg).count();
         if n_clear < (infos.len() / 5).max(1) && max_fg < 0.6 {
-            println!(
+            say!(
                 "  only {} of {} frames have foreground ≤ {:.0}%: frames with foreground (masked) are admitted up to 60%",
                 n_clear, infos.len(), 100.0 * max_fg
             );
@@ -680,7 +748,7 @@ fn main() -> Result<()> {
             }
         }
         let n_stack = infos.iter().filter(|f| f.in_stack).count();
-        println!(
+        say!(
             "stack selection: {} of {} aligned frames (median sky {:.4}, tolerance ×{:.2}); {} with foreground (masked); excluded: {} for foreground > {:.0}%, {} for bright sky, {} for dark sky; {} with saturated sky (≥ {:.0}%) are not exported",
             n_stack, infos.len(), med_level, tol, n_with_fg, n_fg, 100.0 * max_fg, n_bright, n_dark, n_sat, 100.0 * EXPORT_MAX_LEVEL
         );
@@ -689,7 +757,7 @@ fn main() -> Result<()> {
         }
         if std::env::var_os("APILAAA_DEBUG").is_some() {
             for f in infos.iter().filter(|f| !f.in_stack) {
-                println!("  excluded from the stack: {} (sky {:.4}, foreground {:.1}%)",
+                say!("  excluded from the stack: {} (sky {:.4}, foreground {:.1}%)",
                     paths[f.idx].file_name().unwrap().to_string_lossy(), f.level, 100.0 * f.mask.fraction());
             }
         }
@@ -721,7 +789,7 @@ fn main() -> Result<()> {
         flatten::fit_flat_field(&maps, &masks, &levels)
     };
     if untracked {
-        println!("flat field: {}", flat.report());
+        say!("flat field: {}", flat.report());
     }
     if flat.usable {
         for f in infos.iter_mut() {
@@ -740,7 +808,7 @@ fn main() -> Result<()> {
         let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.mask.clone()).collect();
         let (bg, filled) = flatten::temporal_median_masked(&maps, &masks);
         if filled > 0 {
-            println!("  [{label}] {} map cells always covered, filled in from neighbours", filled);
+            say!("  [{label}] {} map cells always covered, filled in from neighbours", filled);
         }
         if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
             let idxs: Vec<usize> = sel.iter().map(|f| f.idx).collect();
@@ -753,7 +821,7 @@ fn main() -> Result<()> {
         drop(masks);
         let mut model = flatten::GlareModel::fit(&bg, w_ref, h_ref, !args.no_residual_surface);
         model.flat = if flat.usable { Some(flat.clone()) } else { None };
-        println!("glare/gradient [{label}]: {}", model.report());
+        say!("glare/gradient [{label}]: {}", model.report());
         if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
             flatten::debug_dump(&bg, &model, &Path::new(&dir).join(label))?;
         }
@@ -764,10 +832,10 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|v| format!("{v:+.1}"))
                     .collect();
-                println!("  radial profile {name} (every {:.0}px, % vs r=0): {}", model.r_step, p.join(" "));
+                say!("  radial profile {name} (every {:.0}px, % vs r=0): {}", model.r_step, p.join(" "));
             }
         }
-        println!(
+        say!(
             "  model [{label}] fitted over {} frames in {:.2}s",
             sel.len(),
             tf.elapsed().as_secs_f32()
@@ -779,7 +847,9 @@ fn main() -> Result<()> {
     // anomaly of every frame in the sequence (`fit_frame_corr_ex`), which
     // absorbs whatever that frame has more or less of compared to that
     // median (horizon glow, twilight, halo amplitude).
+    ui::phase("fitting the halo + gradient model");
     let stack_model = if flatten_on { Some(fit_model(&stack_infos, "stack")?) } else { None };
+    check_abort()?;
 
     // ---------------------------------------------------------------
     // Pass 2: stacking. Every selected frame is loaded again, cleaned
@@ -794,19 +864,23 @@ fn main() -> Result<()> {
         for info in &stack_infos {
             acc.add_coverage(w_ref, h_ref, &info.m);
         }
-        println!(
+        say!(
             "no stack: coverage of {} frames only, in {:.1}s",
             stack_infos.len(),
             ts.elapsed().as_secs_f32()
         );
+        ui::task_begin("stack", "stack", stack_infos.len() as u64);
+        ui::task_end("stack", String::from("not written (--no-stack)"));
     } else {
         let ts = Instant::now();
         let n_stack = stack_infos.len();
-        println!(
+        say!(
             "stacking {} frames{}...",
             n_stack,
             if untracked { " (untracked: the mean of a fixed sequence is a star-trail image)" } else { "" }
         );
+        ui::phase("pass 2: cleaning and stacking");
+        ui::task_begin("stack", "stack", n_stack as u64);
         let next_k = AtomicUsize::new(0);
         let scatter_comp = args.scatter_comp;
         let (tx, rx) = sync_channel::<Result<(usize, Vec<f32>)>>(chan_cap);
@@ -821,7 +895,7 @@ fn main() -> Result<()> {
                 s.spawn(move || {
                     loop {
                         let k = next_k.fetch_add(1, Ordering::Relaxed);
-                        if k >= n_stack {
+                        if k >= n_stack || ui::aborted() {
                             break;
                         }
                         let info = stack_infos[k];
@@ -865,13 +939,16 @@ fn main() -> Result<()> {
                 let mask = if untracked { None } else { Some(&info.mask) };
                 acc.add(&img, w_ref, h_ref, [1.0; 3], &info.m, mask);
                 done += 1;
+                ui::task_add("stack", 1);
                 if done % 25 == 0 || done == n_stack {
-                    println!("  [{}/{}] stacked ({:.1}s)", done, n_stack, ts.elapsed().as_secs_f32());
+                    say!("  [{}/{}] stacked ({:.1}s)", done, n_stack, ts.elapsed().as_secs_f32());
                 }
             }
             Ok::<(), anyhow::Error>(())
         })?;
-        println!("stacked: {}  total time: {:.1}s", done, t0.elapsed().as_secs_f32());
+        say!("stacked: {}  total time: {:.1}s", done, t0.elapsed().as_secs_f32());
+        ui::task_end("stack", format!("{done} frames, {:.1}s", ts.elapsed().as_secs_f32()));
+        check_abort()?;
     }
 
     let corr = stack_model
@@ -884,7 +961,7 @@ fn main() -> Result<()> {
         acc.finalize_cropped(None)
     };
     if out_w != acc.width || out_h != acc.height {
-        println!(
+        say!(
             "crop from drift: {}×{} → {}×{} (−{} px height, −{} px width)",
             acc.width, acc.height, out_w, out_h,
             acc.height - out_h, acc.width - out_w
@@ -902,7 +979,7 @@ fn main() -> Result<()> {
             }
         }
         if holes > 0 || min_count < stack_infos.len() as f32 - 0.5 {
-            println!(
+            say!(
                 "  stack coverage: minimum {:.0} samples/pixel out of {} frames{}",
                 min_count,
                 stack_infos.len(),
@@ -932,7 +1009,7 @@ fn main() -> Result<()> {
                 d(a).partial_cmp(&d(b)).unwrap()
             })
             .ok_or_else(|| anyhow!("no frame available as the stack's levels reference"))?;
-        println!(
+        say!(
             "stretch from {} (sky {:.4}, closest to the session median {:.4}) — a star-trail stack cannot set its own levels",
             paths[rep.idx].file_name().unwrap().to_string_lossy(), rep.level, med_level
         );
@@ -942,14 +1019,15 @@ fn main() -> Result<()> {
         let img = flatten::clean_frame(model, &frame, Some(&fc), true, args.scatter_comp);
         Some(output::analyze_stretch(&img))
     } else {
-        println!("stretch analysis over the balanced stack ({}×{})", out_w, out_h);
+        say!("stretch analysis over the balanced stack ({}×{})", out_w, out_h);
         Some(output::analyze_stretch(&out))
     };
+    ui::phase("writing the DNG");
     if args.no_stack {
-        println!("no stack written (--no-stack); crop {}×{}", out_w, out_h);
+        say!("no stack written (--no-stack); crop {}×{}", out_w, out_h);
     } else {
         output::write_dng(&args.output, &out, out_w, out_h, &camera_model, stretch)?;
-        println!("DNG written: {}", args.output.display());
+        say!("DNG written: {}", args.output.display());
     }
 
     // Photographic metadata of the source RAW, written natively into every
@@ -959,11 +1037,11 @@ fn main() -> Result<()> {
     // when installed, then adds MakerNotes, XMP and ICC on top.
     let src_exif = match exif::read_source(&paths[0]) {
         Ok(e) => {
-            println!("EXIF from the source: {}", e.describe());
+            say!("EXIF from the source: {}", e.describe());
             Some(e)
         }
         Err(e) => {
-            println!("WARNING: could not read the source EXIF: {e:#}");
+            say!("WARNING: could not read the source EXIF: {e:#}");
             None
         }
     };
@@ -981,23 +1059,23 @@ fn main() -> Result<()> {
                 if let Some(e) = &src_exif {
                     exif::embed(path, e)?;
                 }
-                println!("removed layer written: {}", path.display());
+                say!("removed layer written: {}", path.display());
             }
-            _ => println!("WARNING: --dump-correction ignored (correction disabled)"),
+            _ => say!("WARNING: --dump-correction ignored (correction disabled)"),
         }
     }
 
     if !args.no_stack {
-        print!("copying MakerNotes + XMP + ICC from {}... ", paths[0].file_name().unwrap().to_string_lossy());
-        use std::io::Write;
-        std::io::stdout().flush().ok();
+        let src = paths[0].file_name().unwrap().to_string_lossy().to_string();
         match output::copy_metadata(&paths[0], &args.output) {
-            Ok(()) => println!("ok"),
-            Err(e) => println!("WARNING: {e:#} — the DNG keeps the EXIF written natively, without MakerNotes/XMP"),
+            Ok(()) => say!("MakerNotes + XMP + ICC copied from {src}"),
+            Err(e) => say!("WARNING: could not copy MakerNotes/XMP/ICC from {src}: {e:#} — the DNG keeps the EXIF written natively"),
         }
     }
 
     if let Some(dir) = &args.export_clean {
+        ui::phase("exporting the clean sequence");
+        check_abort()?;
         let Some((bg_med, model)) = &stack_model else {
             return Err(anyhow!("--export-clean requires the correction to be enabled (drop --no-flatten)"));
         };
@@ -1026,7 +1104,7 @@ fn main() -> Result<()> {
                     d(a).partial_cmp(&d(b)).unwrap()
                 })
                 .ok_or_else(|| anyhow!("no frame available as the export's levels reference"))?;
-            println!(
+            say!(
                 "levels reference: {} (sky {:.4}, closest to the session median {:.4}) — the star-trail stack is not one",
                 paths[rep.idx].file_name().unwrap().to_string_lossy(), rep.level, med_level
             );
