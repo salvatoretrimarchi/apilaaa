@@ -2178,6 +2178,15 @@ fn dome_bounds(level_ratio: f32) -> (f32, f32) {
     (lo, hi.max(lo))
 }
 
+/// Amplitude of the per-frame anomaly surface, as a fraction of the frame's
+/// own sky, at which it stops being taken for light that belongs to the
+/// session and starts being taken for weather: from `SURF_AMP0` the surface
+/// is faded out, and by `SURF_AMP1` nothing of it is left. A clear frame of
+/// the test session spans a few per cent; a clouded one, one to four times
+/// the sky.
+const SURF_AMP0: f32 = 0.25;
+const SURF_AMP1: f32 = 1.00;
+
 /// Radii (in r_full) of the gain ramp (0 in the core → 1 outside).
 const FRAME_GAIN_R0: f32 = 0.20;
 const FRAME_GAIN_R1: f32 = 0.35;
@@ -2370,7 +2379,7 @@ pub fn fit_frame_corr_ex(
     // squares surface without rejection, more flexible, and gain 1 (the
     // deep-night model only).
     let bright = level_ratio > FRAME_BRIGHT_RATIO;
-    let (surface, coef, coef_dome) = if bright {
+    let (mut surface, coef, coef_dome) = if bright {
         fit_surface_core(
             gw, gh, map.block, &resid0, &sky, surf_step_cells, surf_lambda * BRIGHT_LAMBDA_RATIO, true, None, Some(&k_dome), false,
         )
@@ -2408,6 +2417,37 @@ pub fn fit_frame_corr_ex(
         let mn = v.iter().cloned().fold(f32::MAX, f32::min);
         range[c] = mx - mn;
         pedestal[c] = median_inplace(&mut v);
+    }
+    // Weather is not an anomaly of the instrument. The surface is meant for
+    // the light that grows over a session — horizon glow, twilight, the
+    // moon rising — and its own amplitude is what tells that apart from a
+    // cloud: measured over this session, a clear frame's surface spans a
+    // few per cent of the sky and a clouded one's spans one to four times
+    // it. Subtracting the second flattens the cloud to sky level and leaves
+    // its stars standing on a background that is no longer there, which is
+    // how a cloudy frame came out with a harder, whiter star field than a
+    // clear one. Past `SURF_AMP0` the surface is faded out, and by
+    // `SURF_AMP1` only the model is left — the cloud stays in the picture,
+    // as bright as it was.
+    let sky_level = {
+        let mut v: Vec<f32> = (0..n).filter(|&i| sky(i)).map(|i| map.data[i * 3 + 1]).collect();
+        if v.is_empty() { 0.0 } else { median_inplace(&mut v) }
+    };
+    let damp = {
+        let a = range[1] / sky_level.max(1e-9);
+        let t = ((a - SURF_AMP0) / (SURF_AMP1 - SURF_AMP0)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    };
+    if damp < 1.0 {
+        for node in surface.data.chunks_mut(3) {
+            for c in 0..3 {
+                node[c] = pedestal[c] + damp * (node[c] - pedestal[c]);
+            }
+        }
+        for c in 0..3 {
+            range[c] *= damp;
+            surface.range[c] *= damp;
+        }
     }
     if std::env::var_os("APILAAA_DEBUG_CORR").is_some() {
         let lv = {

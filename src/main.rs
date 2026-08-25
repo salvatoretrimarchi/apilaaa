@@ -109,6 +109,17 @@ struct Args {
     #[arg(long)]
     export_no_transients: bool,
 
+    /// In --export-clean, do NOT treat the sky covered by cloud as the
+    /// frame's own. By default a cloud is marked like the foreground is: it
+    /// does not enter the temporal window (the cloud is the one thing in
+    /// the frame that does not follow the sky, so combining it would show
+    /// the stars of the neighbouring frames through it) and it does not
+    /// enter the frame's level statistics (a light-polluted cloud is
+    /// brighter than any star and takes over the high percentile the
+    /// deflickering reads the star cores from).
+    #[arg(long)]
+    export_no_cloud_guard: bool,
+
     /// Contrast compensation in the halo/veil areas (β): the veil light is
     /// scattered light missing from the structure of that area; after
     /// subtracting the veil, the deviation from the sky is rescaled by
@@ -1038,11 +1049,12 @@ fn main() -> Result<()> {
                 }
                 (img, pm)
             };
-            let stats = timelapse::stats(&img, Some(&pmask));
+            let (sw, sh) = if stabilize { (out_w, out_h) } else { (w_ref, h_ref) };
+            let stats = timelapse::stats(&img, sw, sh, Some(&pmask));
             let st = if args.no_stretch { None } else { Some(output::analyze_stretch(&img)) };
             (stats, st)
         } else {
-            (timelapse::stats(&out, None), stretch)
+            (timelapse::stats(&out, out_w, out_h, None), stretch)
         };
         let opts = timelapse::ExportOpts {
             dir,
@@ -1056,6 +1068,7 @@ fn main() -> Result<()> {
             scatter_comp: args.scatter_comp,
             sky_links: if sky_links.is_empty() { None } else { Some(&sky_links) },
             anomaly,
+            cloud_guard: !args.export_no_cloud_guard,
         };
         drop(out);
         drop(acc);

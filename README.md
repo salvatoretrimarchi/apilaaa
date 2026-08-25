@@ -363,6 +363,7 @@ entirely — and with it `--export-clean`, which refuses to run without a model.
 | `--export-no-stabilize` | off | Export in sensor coordinates, uncropped (this also disables temporal denoising). |
 | `--export-no-deflicker` | off | Skip the per-channel level matching on export. |
 | `--export-no-transients` | off | Let the temporal combination erase meteors, satellites and planes. |
+| `--export-no-cloud-guard` | off | Let a cloud take part in the temporal window and in the frame's level statistics, as it did before the guard existed. |
 
 ### Untracked sequences
 
@@ -709,6 +710,16 @@ lens and can never fall below the deep-night median. How much freedom that
 surface gets is fixed at `Full` for a tracked sequence and chosen by
 `--fixed-anomaly` for an untracked one.
 
+Weather is not an anomaly of the instrument, and the surface's own amplitude is
+what tells the two apart: over the test session a clear frame's surface spans a
+few per cent of the sky and a clouded one's spans one to four times it. Past a
+quarter of the sky the surface is therefore faded out, and by a full sky nothing
+of it is left — the cloud stays in the picture as bright as it was. Subtracting
+it instead would flatten the cloud to sky level and leave its stars standing on
+a background that is no longer there, which is what gave a clouded frame a
+harder, whiter star field than a clear one. The dome amplitude is bounded on the
+same grounds (see `dome_bounds`), and neither guard needs a cloud detector.
+
 Optionally, `--scatter-comp` compensates the contrast loss the veil implies:
 where the defect is strong a fraction of the image light has been scattered into
 it, so after subtracting the veil the deviation from the sky level is rescaled by
@@ -758,9 +769,25 @@ controls itself. Without it the DNG keeps the native EXIF and only loses those.
 chronological order and with the same stretch as the stack, so the sequence and
 the stack are directly comparable. Each frame is cleaned with the model and its
 own anomaly, stabilized into the reference system with the very transform used
-for stacking and cropped identically, then levelled: per channel, its sky median
-and its 99.9th percentile are matched to the stack's by a linear gain and offset,
-which stops tone, brightness and contrast from drifting across the session.
+for stacking and cropped identically, then levelled: per channel, its sky level
+and its star-core amplitude are matched to the stack's by a linear gain and
+offset, which stops tone, brightness and contrast from drifting across the
+session.
+
+Neither of those two statistics is read the obvious way, because a cloud must
+not move them. The sky level is the 20th percentile of the lightly blurred
+channel rather than its median: a cloud only ever adds light, so the sky is read
+from below it, and a frame the cloud covers for the most part still measures its
+clear sky and not its cloud. The star-core amplitude is the 99.9th percentile of
+the **high-pass** — the channel minus its own blur — rather than of the channel
+itself: a cloud is smooth and contributes nothing to it, whereas a
+light-polluted cloud is brighter than any star and used to take the plain
+percentile over completely. The gain itself may compress the
+contrast but never expand it: a frame whose star cores come out below the
+reference's has almost always lost them to the atmosphere — cloud, haze, dew —
+and stretching them back up is precisely what made the stars of a clouded frame
+burn brighter than the stars of a clear one, and what pushed the cloud they sit
+on past the white of the stretch on the way.
 
 On an untracked sequence the levels reference is **not** the stack, and neither
 is the stretch. There the stack is a star-trail image: a star lands on a given
@@ -779,6 +806,21 @@ free. Foreground pixels are excluded from that combination, so trees and horizon
 stay sharp instead of being smeared with their neighbours. On an untracked
 sequence the window is warped onto the sky through the chain of consecutive star
 fits before combining, since there the sky is what moves between neighbours.
+
+A cloud is the one thing in the frame that does not follow the sky: it crosses
+it. Combining the window on the sky therefore hands back, at full brightness, a
+star this frame has behind a cloud and its neighbours have in the clear — over a
+cloud that the same combination has meanwhile averaged smooth. Before anything
+else is restored, the export undoes its own combination wherever that happened.
+What it measures is the loss of star signal, not brightness: the high-pass with
+its noise floor subtracted, averaged over a neighbourhood, in the frame and in
+the combination. Where the frame keeps as much as the combination the two agree;
+where a cloud has taken the stars away, the frame's is only its noise and the
+ratio collapses. The frame is faded back in over that ratio, with the weight
+smoothed over 128 px so that it follows the body of a cloud rather than stamping
+a disc around every dimmed star. Brightness is deliberately not part of the
+test — the Milky Way is broad and bright too, and it is full of stars.
+`--export-no-cloud-guard` turns both halves of this off.
 
 Because a trimmed mean would also erase what appears in a single frame, genuine
 transients are detected and restored afterwards. The frame's excess over the

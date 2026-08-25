@@ -49,40 +49,83 @@ pub struct Stats {
 
 const HI_PERCENTILE: f32 = 99.9;
 
-/// Per-channel median and high percentile over ~1M stratified samples.
-/// `mask` (optional, one byte per pixel, ≠0 = foreground) excludes those
-/// pixels: the tree/horizon must not move the sky median.
-pub fn stats(rgb: &[f32], mask: Option<&[u8]>) -> Stats {
-    let n_pix = rgb.len() / 3;
+/// Per-channel sky level and star-core amplitude, over ~1M stratified
+/// samples. `mask` (optional, one byte per pixel, ≠0 = foreground) excludes
+/// those pixels: the tree/horizon is not sky.
+///
+/// Neither statistic may depend on how much of the frame a cloud covers,
+/// because the deflickering divides one by the other and a light-polluted
+/// cloud is the brightest thing in the frame:
+///
+/// * `med` is the `SKY_PERCENTILE`-th percentile of the channel after a
+///   light blur, not its median. A cloud only adds light, so the level of
+///   the sky is read from below it.
+/// * `hi` is that level plus the high percentile of the **high-pass**
+///   (channel − its own blur): the amplitude of a star core over the sky it
+///   sits on. A cloud is smooth and contributes nothing to it, so what gets
+///   measured is always the brightest star cores the frame still shows.
+pub fn stats(rgb: &[f32], w: usize, h: usize, mask: Option<&[u8]>) -> Stats {
+    let n_pix = w * h;
     let stride = (n_pix / 1_000_000).max(1);
     let mut s = Stats { med: [0.0; 3], hi: [0.0; 3] };
+    let pick = |v: &mut Vec<f32>, pct: f32| -> f32 {
+        let k = ((v.len() as f32 * pct / 100.0) as usize).min(v.len() - 1);
+        let (_, x, _) = v.select_nth_unstable_by(k, |a: &f32, b: &f32| a.partial_cmp(b).unwrap());
+        *x
+    };
     for c in 0..3 {
-        let mut v: Vec<f32> = (0..n_pix)
-            .step_by(stride)
-            .filter(|&i| mask.map_or(true, |m| m[i] == 0))
-            .map(|i| rgb[i * 3 + c])
-            .filter(|x| x.is_finite())
-            .collect();
-        if v.is_empty() {
+        let ch: Vec<f32> = (0..n_pix).into_par_iter().map(|i| rgb[i * 3 + c]).collect();
+        let b = box_blur(&ch, w, h, OCC_STAR_RADIUS);
+        let keep = |i: &usize| mask.map_or(true, |m| m[*i] == 0);
+        let mut lv: Vec<f32> = (0..n_pix).step_by(stride).filter(keep).map(|i| b[i]).filter(|x| x.is_finite()).collect();
+        if lv.is_empty() {
             continue;
         }
-        let k = v.len() / 2;
-        let (_, m, _) = v.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
-        s.med[c] = *m;
-        let kh = ((v.len() as f32 * HI_PERCENTILE / 100.0) as usize).min(v.len() - 1);
-        let (_, h, _) = v.select_nth_unstable_by(kh, |a, b| a.partial_cmp(b).unwrap());
-        s.hi[c] = *h;
+        // Below the sky percentile there must be sky, not landscape: the
+        // stack's reference statistics are taken without a mask, and a
+        // horizon covering a fifth of the frame is exactly what the 20th
+        // percentile would land on. Anything clearly darker than the median
+        // is not sky (`SKY_DARK_MIN`, as in the transient detection) and is
+        // dropped first.
+        let med = pick(&mut lv, 50.0);
+        let dark = SKY_DARK_MIN * med;
+        let mut sky: Vec<f32> = lv.iter().copied().filter(|&v| v >= dark).collect();
+        if sky.is_empty() {
+            sky = lv;
+        }
+        s.med[c] = pick(&mut sky, SKY_PERCENTILE);
+        let mut hv: Vec<f32> = (0..n_pix)
+            .step_by(stride)
+            .filter(keep)
+            .filter(|&i| b[i] >= dark)
+            .map(|i| ch[i] - b[i])
+            .filter(|x| x.is_finite())
+            .collect();
+        if hv.is_empty() {
+            continue;
+        }
+        s.hi[c] = s.med[c] + pick(&mut hv, HI_PERCENTILE).max(0.0);
     }
     s
 }
 
 /// Per-channel gain + offset to bring `cur` to `reference`.
-/// `v' = (v − med_cur)·g + med_ref`, `g = (hi_ref − med_ref)/(hi_cur − med_cur)`.
-pub fn normalize(rgb: &mut [f32], cur: &Stats, reference: &Stats) -> [f32; 3] {
+/// `v' = (v − med_cur)·g + med_ref`, `g = (hi_ref − med_ref)/(hi_cur − med_cur)`:
+/// the offset matches the level and the gain the star-core contrast.
+///
+/// With `guard` on the gain may compress the contrast but never expand it.
+/// A frame whose star cores come out below the reference's has almost
+/// always lost them to the atmosphere — cloud, haze, dew — and stretching
+/// them back up to the reference is exactly what makes the stars of a
+/// clouded frame burn brighter than the stars of a clear one, and what
+/// blows the cloud they sit on past the white of the stretch along the way.
+pub fn normalize(rgb: &mut [f32], cur: &Stats, reference: &Stats, guard: bool) -> [f32; 3] {
     let mut gain = [1.0f32; 3];
     for c in 0..3 {
+        let num = reference.hi[c] - reference.med[c];
         let den = (cur.hi[c] - cur.med[c]).max(1e-6);
-        gain[c] = ((reference.hi[c] - reference.med[c]) / den).clamp(0.25, 4.0);
+        let hi = if guard { 1.0 } else { 4.0 };
+        gain[c] = (num / den).clamp(0.25, hi);
     }
     rgb.par_chunks_mut(3).for_each(|px| {
         for c in 0..3 {
@@ -344,6 +387,35 @@ const TRANSIENT_HP_RADIUS: usize = 32;
 /// transient purposes (foreground and its penumbra).
 const TRANSIENT_SKY_MIN: f32 = 0.6;
 
+/// Radius (px) of the high-pass that separates the stars from the sky they
+/// sit on, and radius over which its modulus is averaged to measure how
+/// much star signal a region carries.
+const OCC_STAR_RADIUS: usize = 8;
+const OCC_STAR_AVG: usize = 48;
+/// Sigmas of the high-pass noise subtracted before a region's star signal
+/// is measured.
+const OCC_NOISE_K: f32 = 3.0;
+/// Radius (px) the occlusion weight is smoothed over.
+const OCC_SMOOTH: usize = 128;
+/// Factor the occlusion measurement is downscaled by. Every radius above is
+/// given in full-size pixels and divided by it.
+const OCC_SCALE: usize = 4;
+/// Ratio between the star signal of the frame and that of its temporal
+/// combination below which the frame counts as occluded there — a cloud
+/// passing in front of that patch of sky. The ramp runs from `OCC_R1` (the
+/// combination is left alone) to `OCC_R0` (the frame is shown as it is), so
+/// that the edge of a cloud does not become an edge in the image.
+const OCC_R0: f32 = 0.40;
+const OCC_R1: f32 = 0.75;
+/// Percentile of the (lightly blurred) channel taken as the frame's sky
+/// level. Not the median: a cloud only ever adds light, so the level of the
+/// sky is read below it, low enough that a frame the cloud covers for the
+/// most part still measures its clear sky and not its cloud.
+const SKY_PERCENTILE: f32 = 20.0;
+/// Fraction of the median below which a pixel is not sky (foreground and
+/// its penumbra), as in `TRANSIENT_SKY_MIN`.
+const SKY_DARK_MIN: f32 = 0.6;
+
 /// Separable box moving average (radius `r`, clipped border) — O(n).
 pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let mut tmp = vec![0.0f32; w * h];
@@ -379,6 +451,178 @@ pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
         for x in 0..w { row[x] = cols[x][y]; }
     });
     out
+}
+
+/// Three box passes ≈ a Gaussian. The shape of the kernel reaches the
+/// image: a single box is square, and a square response around every bright
+/// star tiles the export with square patches.
+pub(crate) fn blur_gauss(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut b = box_blur(src, w, h, r);
+    b = box_blur(&b, w, h, (r / 2).max(1));
+    box_blur(&b, w, h, (r / 2).max(1))
+}
+
+/// Undoes the temporal combination wherever the cloud covers the frame's
+/// sky, and returns how much of the frame that was.
+///
+/// The window is combined **on the sky**: the neighbours are warped so that
+/// their stars fall on the current frame's stars. A cloud does not follow
+/// the sky — it crosses it — so a star this frame has behind a cloud is
+/// clear in the neighbours, and the trimmed mean hands it back at its full
+/// brightness over a cloud that has meanwhile been averaged smooth. That is
+/// what puts a field of hard white stars on top of a cloud that in the
+/// frame hides them, and it is not what the sequence looked like.
+///
+/// Occlusion is measured as the loss of star signal, not as brightness: the
+/// modulus of the high-pass with its noise floor subtracted, averaged over
+/// `OCC_STAR_AVG`, in the frame and in the combination. Where the frame keeps as much as the
+/// combination the two agree; where a cloud has taken the stars away the
+/// frame's is only its noise and the ratio collapses. The frame is faded
+/// back in over the ramp `OCC_R1` → `OCC_R0` so the edge of a cloud does not
+/// come out as an edge in the image. Brightness is deliberately not part of
+/// the test: the Milky Way is broad and bright too, and it is full of stars.
+pub fn preserve_occlusions(cur: &[f32], combined: &mut [f32], fg: &[u8], w: usize, h: usize) -> f32 {
+    // The whole measurement runs on a quarter-scale luminance. What comes
+    // out of it is a weight smoothed over a hundred-odd pixels, so the
+    // detail thrown away is detail it would have blurred away anyway — and
+    // at full size the dozen box passes below cost more than the temporal
+    // combination they correct.
+    let (sw, sh) = ((w / OCC_SCALE).max(1), (h / OCC_SCALE).max(1));
+    let sn = sw * sh;
+    let small_lum = |img: &[f32]| -> Vec<f32> {
+        let mut out = vec![0.0f32; sn];
+        out.par_chunks_mut(sw).enumerate().for_each(|(y, row)| {
+            for x in 0..sw {
+                let mut acc = 0.0f32;
+                let mut cnt = 0.0f32;
+                for yy in y * OCC_SCALE..((y + 1) * OCC_SCALE).min(h) {
+                    for xx in x * OCC_SCALE..((x + 1) * OCC_SCALE).min(w) {
+                        let i = (yy * w + xx) * 3;
+                        acc += img[i] + img[i + 1] + img[i + 2];
+                        cnt += 3.0;
+                    }
+                }
+                row[x] = if cnt > 0.0 { acc / cnt } else { 0.0 };
+            }
+        });
+        out
+    };
+    // Star signal: the high-pass with its noise floor taken off, averaged
+    // over a neighbourhood. The floor matters — the modulus of the
+    // high-pass of a 25 s frame is mostly noise, and a measure that noise
+    // dominates says the same thing under a cloud as under a clear sky.
+    // What is left after subtracting OCC_NOISE_K sigmas is the stars.
+    // The floor is the **frame's**, and it is the one used on both sides.
+    // Each image measured against its own would compare unequal things: the
+    // combination has already had its noise divided by the window, so a
+    // floor of its own would leave it more signal than the frame keeps
+    // wherever the sky is empty, and that difference alone — not a cloud —
+    // would undo the noise reduction over a good part of a clear frame.
+    let hp = |lum: &[f32]| -> Vec<f32> {
+        let b = blur_gauss(lum, sw, sh, (OCC_STAR_RADIUS / OCC_SCALE).max(1));
+        lum.par_iter().zip(b.par_iter()).map(|(l, s)| (l - s).abs()).collect()
+    };
+    let hc = hp(&small_lum(cur));
+    let hk = hp(&small_lum(combined));
+    let sigma = {
+        let stride = (sn / 1_000_000).max(1);
+        let mut sample: Vec<f32> = hc.iter().step_by(stride).copied().collect();
+        let k = sample.len() / 2;
+        let (_, med, _) = sample.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+        // median(|x|) = 0.6745 sigma for a centred normal.
+        *med * 1.4826
+    };
+    let star = |h: &[f32]| -> Vec<f32> {
+        let core: Vec<f32> = h.par_iter().map(|v| (v - OCC_NOISE_K * sigma).max(0.0)).collect();
+        blur_gauss(&core, sw, sh, (OCC_STAR_AVG / OCC_SCALE).max(1))
+    };
+    let sc = star(&hc);
+    let sk = star(&hk);
+    // Scale below which there is no star signal to speak of on either side:
+    // the ratio there must come out as 1 (nothing to bring back), not as
+    // the quotient of two noises.
+    let eps = 0.5 * (sk.par_iter().map(|&v| v as f64).sum::<f64>() / sn as f64) as f32;
+    let raw: Vec<f32> = (0..sn)
+        .into_par_iter()
+        .map(|i| {
+            let r = (sc[i] + eps) / (sk[i] + eps).max(1e-9);
+            let t = ((OCC_R1 - r) / (OCC_R1 - OCC_R0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        })
+        .collect();
+    // The weight is a map of how much cloud lies over the frame, not a
+    // per-star verdict: smoothed over `OCC_SMOOTH` it follows the body of a
+    // cloud and dilutes the disc a single dimmed star would otherwise stamp
+    // on the export.
+    //
+    // The foreground is left out of that average, and the average is
+    // normalized by what did take part. A tree hides the sky exactly as a
+    // cloud does and reads the same here, but it is the mask that already
+    // gives those pixels to the frame; letting them into the blur would
+    // spread the tree's verdict over the sky around it and undo the noise
+    // reduction along the whole horizon.
+    let valid: Vec<f32> = (0..sn)
+        .into_par_iter()
+        .map(|i| {
+            let (sx, sy) = (i % sw, i / sw);
+            let mut any_fg = false;
+            for yy in sy * OCC_SCALE..((sy + 1) * OCC_SCALE).min(h) {
+                for xx in sx * OCC_SCALE..((sx + 1) * OCC_SCALE).min(w) {
+                    if fg[yy * w + xx] != 0 {
+                        any_fg = true;
+                    }
+                }
+            }
+            if any_fg { 0.0 } else { 1.0 }
+        })
+        .collect();
+    let ws = {
+        let r = (OCC_SMOOTH / OCC_SCALE).max(1);
+        let num = blur_gauss(&raw.par_iter().zip(valid.par_iter()).map(|(a, b)| a * b).collect::<Vec<f32>>(), sw, sh, r);
+        let den = blur_gauss(&valid, sw, sh, r);
+        num.par_iter()
+            .zip(den.par_iter())
+            .zip(valid.par_iter())
+            .map(|((n, d), v)| if *v == 0.0 || *d <= 1e-6 { 0.0 } else { n / d })
+            .collect::<Vec<f32>>()
+    };
+    let area = ws.par_iter().map(|&v| v as f64).sum::<f64>() / sn as f64;
+    if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
+        // Occlusion weight (8-bit PGM at the measurement's own scale).
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut buf = format!("P5\n{} {}\n255\n", sw, sh).into_bytes();
+        buf.extend(ws.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0) as u8));
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("occluded_{k:04}.pgm")), buf);
+    }
+    // Back to full size, bilinear on the small grid (node = block centre).
+    let sample_w = |x: usize, y: usize| -> f32 {
+        let fx = (x as f32 + 0.5) / OCC_SCALE as f32 - 0.5;
+        let fy = (y as f32 + 0.5) / OCC_SCALE as f32 - 0.5;
+        let x0 = fx.floor().clamp(0.0, (sw - 1) as f32) as usize;
+        let y0 = fy.floor().clamp(0.0, (sh - 1) as f32) as usize;
+        let x1 = (x0 + 1).min(sw - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let dx = (fx - x0 as f32).clamp(0.0, 1.0);
+        let dy = (fy - y0 as f32).clamp(0.0, 1.0);
+        ws[y0 * sw + x0] * (1.0 - dx) * (1.0 - dy)
+            + ws[y0 * sw + x1] * dx * (1.0 - dy)
+            + ws[y1 * sw + x0] * (1.0 - dx) * dy
+            + ws[y1 * sw + x1] * dx * dy
+    };
+    combined.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let wgt = sample_w(x, y);
+            if wgt <= 0.0 {
+                continue;
+            }
+            let i = (y * w + x) * 3;
+            for c in 0..3 {
+                row[x * 3 + c] = row[x * 3 + c] * (1.0 - wgt) + cur[i + c] * wgt;
+            }
+        }
+    });
+    area as f32
 }
 
 /// Preserves the transient objects of the current frame (meteors,
@@ -616,6 +860,10 @@ pub struct ExportOpts<'a> {
     pub sky_links: Option<&'a [Option<Similarity>]>,
     /// Freedom given to the per-frame anomaly (see `flatten::AnomalyMode`).
     pub anomaly: flatten::AnomalyMode,
+    /// Treat the sky the cloud covers as the frame's own (see
+    /// `cloud_mask`): keep it out of the temporal window and out of the
+    /// frame's level statistics.
+    pub cloud_guard: bool,
 }
 
 /// Exports the sequence. `infos` = aligned frames (similarity ref→cur,
@@ -770,8 +1018,8 @@ pub fn export_sequence(
                     // frame); the natural one is blended after combining.
                     let mut img = to_ref(flatten::clean_frame(model, &frame, Some(&fc), true, opts.scatter_comp));
                     if opts.deflicker {
-                        let cur = stats(&img, Some(&pmask));
-                        let g = normalize(&mut img, &cur, &reference);
+                        let cur = stats(&img, ow, oh, Some(&pmask));
+                        let g = normalize(&mut img, &cur, &reference, opts.cloud_guard);
                         gain_txt += &format!("  gain R/G/B {:.3}/{:.3}/{:.3}  sky {:+.2}%", g[0], g[1], g[2],
                             100.0 * (cur.med[1] - reference.med[1]) / reference.med[1].max(1e-9));
                     }
@@ -849,9 +1097,18 @@ pub fn export_sequence(
             (None, _) => (combine_window(&win, &wmasks, cur_k), None),
         };
         let mut kept_txt = String::new();
+        if win.len() > 1 && opts.cloud_guard {
+            // Before the transients: where the cloud covers this frame the
+            // combination has already been undone, so there is no excess
+            // left there for the transient detection to find.
+            let occ = preserve_occlusions(cur, &mut img, wmasks[cur_k], ow, oh);
+            if occ > 0.001 {
+                kept_txt = format!("  occluded {:.1}%", 100.0 * occ);
+            }
+        }
         if win.len() > 1 && opts.keep_transients {
             let kept = preserve_transients(cur, &mut img, wmasks[cur_k], used.as_deref(), ow, oh);
-            kept_txt = format!("  transients {} px", kept);
+            kept_txt += &format!("  transients {} px", kept);
         }
         // Full dawn/twilight: blend with the natural version of the frame.
         if let Some((natural, w)) = &win_entries[cur_k].4 {
