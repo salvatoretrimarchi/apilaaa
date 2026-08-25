@@ -27,6 +27,7 @@
 //!    value from the original frame.
 //! 5. A linear DNG is written with the same stretch as the stack.
 
+use crate::say;
 use crate::align::Similarity;
 use crate::exif;
 use crate::fixed;
@@ -921,7 +922,7 @@ pub fn export_sequence(
         })
         .collect();
     let skipped = paths.len() - order.len();
-    println!(
+    say!(
         "exporting {} frames to {} (window {} frames, stabilize={}, deflicker={}, {}×{}){}",
         order.len(),
         opts.dir.display(),
@@ -933,6 +934,7 @@ pub fn export_sequence(
         if skipped > 0 { format!("; {skipped} skipped (unaligned or sky saturated/above the white)") } else { String::new() }
     );
     let t0 = Instant::now();
+    crate::ui::task_begin("export", "export", order.len() as u64);
 
     // Producer: load + clean + warp in parallel batches; consumer: sliding
     // window in order.
@@ -947,6 +949,9 @@ pub fn export_sequence(
     let batch = opts.n_workers.max(1);
 
     while next_emit < order.len() {
+        if crate::ui::aborted() {
+            return Err(anyhow!("stopped by the user"));
+        }
         // Load until the window of the next frame to emit is covered.
         while next_load < order.len() && next_load <= next_emit + half + batch {
             let end = (next_load + batch).min(order.len());
@@ -1130,7 +1135,7 @@ pub fn export_sequence(
         if output::copy_metadata(&paths[idx], &out).is_err() {
             meta_failed = true;
         }
-        println!(
+        say!(
             "  [{}/{}] {}  window {} frames{}{}",
             next_emit + 1,
             order.len(),
@@ -1140,6 +1145,7 @@ pub fn export_sequence(
             gain_txt
         );
         next_emit += 1;
+        crate::ui::task_add("export", 1);
         // Drop frames that no longer fall into any future window.
         let min_keep = next_emit.saturating_sub(half);
         while let Some(e) = buffer.front() {
@@ -1151,11 +1157,15 @@ pub fn export_sequence(
         }
     }
     if exif_failed {
-        println!("  WARNING: could not read the source EXIF on some frames");
+        say!("  WARNING: could not read the source EXIF on some frames");
     }
     if meta_failed {
-        println!("  WARNING: could not copy MakerNotes/XMP with exiftool on some frames (is it installed?) — the DNGs still carry the EXIF written natively");
+        say!("  WARNING: could not copy MakerNotes/XMP with exiftool on some frames (is it installed?) — the DNGs still carry the EXIF written natively");
     }
-    println!("exported {} frames in {:.1}s", order.len(), t0.elapsed().as_secs_f32());
+    say!("exported {} frames in {:.1}s", order.len(), t0.elapsed().as_secs_f32());
+    crate::ui::task_end(
+        "export",
+        format!("{} frames, {:.1}s", order.len(), t0.elapsed().as_secs_f32()),
+    );
     Ok(())
 }

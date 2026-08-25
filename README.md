@@ -13,6 +13,7 @@ night of frames yields both a deep still and a finished sequence.
 |---|---|
 | **Input** | A directory of Sony `.ARW` frames (one night, tracked or on a fixed tripod) |
 | **Output** | A linear RGB DNG stack, an optional cleaned DNG sequence, an optional "what was removed" layer |
+| **Interface** | Flags, or — started with no arguments — a setup screen and a live dashboard |
 | **Language** | Rust 2024, no GPU, parallel over frames with Rayon |
 | **Platform** | Developed and tested on Linux; binaries also published for Windows and macOS |
 | **Cost** | CPU-bound, RAM-planned at startup |
@@ -122,6 +123,44 @@ Before committing a whole night, try the first few dozen frames:
 
 `--limit` cuts the run to the first N files, which is enough to see whether the
 stars are detected, the alignment locks and the defect model looks sane.
+
+## Running it without arguments
+
+Started with no arguments at all, `apilaaa` opens a setup screen instead of
+running the defaults:
+
+```sh
+./target/release/apilaaa
+```
+
+Every option the command line takes is on it, grouped, and the ones that do not
+apply are left out: the tripod settings only exist once the sequence is marked
+untracked, the timelapse settings only once the export is switched on. The
+frames directory is counted as it is typed, so a path with no `.ARW` in it shows
+up before the run rather than after it, and the equivalent command line is
+written out at the bottom as the form is edited — the screen is a way of finding
+the flags, not a replacement for them.
+
+| Key | Does |
+|---|---|
+| `↑` `↓` | move between fields |
+| `←` `→` | change the focused value |
+| typing | replaces the value of a text or numeric field |
+| `⏎` | accept what was typed; on a field not being edited, start the run |
+| `esc` | leave without running |
+
+The run then reports on a dashboard: the settings that decide the output at the
+top, one progress bar per pass — alignment, stacking, export — and the same log
+underneath, scrollable with `PgUp` / `PgDn` (`End` returns to the tail). `q`
+stops the run: it gives up between frames and never in the middle of writing
+one, so no half-written DNG is left behind. When the run is over the terminal is
+given back and a summary is printed on the normal screen — what each pass got
+through, every warning, the total time — because the dashboard's log goes with
+the alternate screen it was drawn on.
+
+The setup screen is only offered when there are no arguments **and** there is a
+terminal on both stdin and stdout. One flag, a pipe, a redirect, `nohup` or a CI
+job all run exactly as they always have, reporting line by line.
 
 ## Tracked or fixed tripod?
 
@@ -525,6 +564,9 @@ been overruled. The rules worth knowing before a long night:
 ## Reading the console output
 
 The run narrates itself; every line is there to be checked rather than watched.
+This is what it prints with arguments on the command line; started with none, the
+same lines go to the dashboard's log panel instead — see [Running it without
+arguments](#running-it-without-arguments).
 
 ```
 found 517 frames
@@ -940,6 +982,9 @@ export cost at the price of the noise reduction.
 | `src/output.rs` | Stretch analysis, linear DNG writing, metadata copying through exiftool. |
 | `src/exif.rs` | Native EXIF: reads the source RAW's identifying and photographic tags and writes them into the DNG by relocating its IFD0. |
 | `src/timelapse.rs` | Clean sequence export: stabilization, deflickering, temporal denoising, transient preservation, dawn ramp. |
+| `src/ui/mod.rs` | Console front end: the sink every reported line goes through — plain `println!` with arguments on the command line, the dashboard's state without them. |
+| `src/ui/wizard.rs` | The setup screen shown when there are no arguments: the options as a form, with the equivalent command line written out as it is edited. |
+| `src/ui/dash.rs` | The live dashboard: run summary, one progress bar per pass, scrollable log, and the stop key. |
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
 | `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
 | `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
