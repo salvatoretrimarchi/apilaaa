@@ -19,6 +19,13 @@ night of frames yields both a deep still and a finished sequence.
 | **Cost** | CPU-bound, RAM-planned at startup |
 | **Licence** | GPL-3.0-or-later |
 
+![153 frames of the Milky Way stacked, with a flat background and no lens halo left](docs/img/tracked-stack.webp)
+
+<sub>The output DNG of a 517-frame tracked session, developed with nothing but a
+gamma. No retouching, no gradient brush: the background is flat because the
+lens halo and the sky gradient were modelled and subtracted before the frames
+were averaged.</sub>
+
 ## The idea
 
 A tracked sky sequence contains two superimposed signals with opposite
@@ -48,6 +55,35 @@ becomes a star-trail image, which is what averaging a fixed sequence means.
 | **The stack** | `-o stacked.dng` | Every selected frame aligned, cleaned and averaged. Linear RGB DNG, demosaic already done, white balance already baked in, per-channel stretch baked in (or not, with `--no-stretch`). |
 | **The clean sequence** | `--export-clean DIR` | One `<name>_clean.dng` per frame: cleaned with the same model, stabilized into the same coordinate system, cropped identically, deflickered against the stack, temporally denoised, with meteors and satellites preserved. Ready to feed straight to a video encoder. |
 | **The removed layer** | `--dump-correction layer.dng` | Exactly what was subtracted, plus the preserved sky pedestal, under the same crop and stretch as the stack. The audit file: it should contain defect geometry and nothing else. |
+
+## What the correction does
+
+Every panel below is the DNG `apilaaa` writes, opened with a plain gamma and
+nothing else. Nothing is retouched, and the levels in each panel are the ones
+the tool itself picked for that file.
+
+**A tracked session.** The same 517 frames, stacked twice: once with the
+correction off, once with it on.
+
+![The same stack with and without the correction: a washed-out glow on the left, a flat sky with the Milky Way on the right](docs/img/tracked-correction.webp)
+
+The left panel is what a plain stacker gives you — the lens halo, the
+vignetting and the sky gradient averaged in along with the sky, drowning the
+faint structure and leaving a colour cast that no global curve can undo. The
+right panel is the same data with the defect model subtracted **in sensor
+coordinates, before averaging**, which is the one order of operations that can
+tell the two apart.
+
+**A single frame, on a fixed tripod, under heavy light pollution.** The
+timelapse export runs the same model over every frame of the session.
+
+![A milky, light-polluted 25 s frame next to the same frame cleaned, showing the Milky Way](docs/img/frame-cleaned.webp)
+
+This is one 25-second exposure, not a stack. What comes back is not a
+brightness adjustment: the light dome, the vignetting and the frame's own
+gradient are each modelled and removed, and what was underneath them survives.
+Every frame of the sequence gets the same treatment, which is what makes the
+exported timelapse hold still instead of pulsing.
 
 ## Install
 
@@ -149,6 +185,8 @@ the flags, not a replacement for them.
 | `⏎` | accept what was typed; on a field not being edited, start the run |
 | `esc` | leave without running |
 
+![The setup screen: the options as a form, grouped, with the equivalent command line at the bottom](docs/img/ui-setup.webp)
+
 The run then reports on a dashboard: the settings that decide the output at the
 top, one progress bar per pass — alignment, stacking, export — and the same log
 underneath, scrollable with `PgUp` / `PgDn` (`End` returns to the tail). `q`
@@ -157,6 +195,8 @@ one, so no half-written DNG is left behind. When the run is over the terminal is
 given back and a summary is printed on the normal screen — what each pass got
 through, every warning, the total time — because the dashboard's log goes with
 the alternate screen it was drawn on.
+
+![The dashboard mid-run: a bar per pass and the log underneath](docs/img/ui-dashboard.webp)
 
 The setup screen is only offered when there are no arguments **and** there is a
 terminal on both stdin and stdout. One flag, a pipe, a redirect, `nohup` or a CI
@@ -989,6 +1029,7 @@ export cost at the price of the noise reduction.
 | `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
 | `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
 | `.github/workflows/` | Release pipeline. A merge into `main` publishes the next patch version; a `v*` tag publishes exactly that version. A manual run builds the same five archives but publishes nothing. |
+| `docs/img/` | The images the README shows. WebP, versioned on purpose: they are the only files under an ignored extension that belong in the repository. |
 | `.github/release-identity.sh` | Works out the version and whether the run publishes at all, shared by both jobs so they cannot disagree about what is being produced. |
 
 ## Limits
