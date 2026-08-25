@@ -13,8 +13,9 @@ night of frames yields both a deep still and a finished sequence.
 |---|---|
 | **Input** | A directory of Sony `.ARW` frames (one night, tracked or on a fixed tripod) |
 | **Output** | A linear RGB DNG stack, an optional cleaned DNG sequence, an optional "what was removed" layer |
-| **Language** | Rust 2021, no GPU, parallel over frames with Rayon |
-| **Platform** | Linux (tested), CPU-bound, RAM-planned at startup |
+| **Language** | Rust 2024, no GPU, parallel over frames with Rayon |
+| **Platform** | Developed and tested on Linux; binaries also published for Windows and macOS |
+| **Cost** | CPU-bound, RAM-planned at startup |
 | **Licence** | GPL-3.0-or-later |
 
 ## The idea
@@ -47,9 +48,33 @@ becomes a star-trail image, which is what averaging a fixed sequence means.
 | **The clean sequence** | `--export-clean DIR` | One `<name>_clean.dng` per frame: cleaned with the same model, stabilized into the same coordinate system, cropped identically, deflickered against the stack, temporally denoised, with meteors and satellites preserved. Ready to feed straight to a video encoder. |
 | **The removed layer** | `--dump-correction layer.dng` | Exactly what was subtracted, plus the preserved sky pedestal, under the same crop and stretch as the stack. The audit file: it should contain defect geometry and nothing else. |
 
+## Install
+
+Every tagged release carries prebuilt archives, so `cargo` is only needed to
+build from source:
+
+| Archive | Platform |
+|---|---|
+| `apilaaa-<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux, glibc |
+| `apilaaa-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux, statically linked — independent of the distribution's glibc |
+| `apilaaa-<version>-x86_64-pc-windows-msvc.zip` | Windows |
+| `apilaaa-<version>-aarch64-apple-darwin.tar.gz` | macOS, Apple Silicon |
+| `apilaaa-<version>-x86_64-apple-darwin.tar.gz` | macOS, Intel |
+
+Each holds the binary, this README and the licence. `SHA256SUMS` alongside them
+covers the set. The Windows and macOS binaries are built by CI but not tested
+there — Linux is the platform this is developed and run on.
+
+```sh
+tar xzf apilaaa-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+./apilaaa-0.1.0-x86_64-unknown-linux-gnu/apilaaa --version
+```
+
 ## Requirements
 
-- A Rust toolchain (edition 2021).
+- A Rust toolchain, only to build from source. The crate is edition 2024, which
+  needs rustc 1.85 or newer; `rust-toolchain.toml` pins the channel to current
+  stable, so rustup resolves it for you.
 - [`exiftool`](https://exiftool.org/) on `PATH`, optional. Every DNG already
   carries the EXIF that identifies the shot — camera, lens, focal length,
   aperture, exposure, ISO and capture time — written natively with no external
@@ -337,6 +362,7 @@ entirely — and with it `--export-clean`, which refuses to run without a model.
 | `--max-stars <N>` | `40` | Stars used per frame for alignment. |
 | `--limit <N>` | — | Process at most N frames; useful for quick tests. |
 | `--no-stretch` | off | Keep the native sensor scale instead of baking a stretch. |
+| `-V, --version` | — | Print the version, which is the one in `Cargo.toml` and in the release tag. |
 
 ### Defect correction
 
@@ -364,6 +390,7 @@ entirely — and with it `--export-clean`, which refuses to run without a model.
 | `--export-no-deflicker` | off | Skip the per-channel level matching on export. |
 | `--export-no-transients` | off | Let the temporal combination erase meteors, satellites and planes. |
 | `--export-no-cloud-guard` | off | Let a cloud take part in the temporal window and in the frame's level statistics, as it did before the guard existed. |
+| `--no-stack` | off | Skip the stack entirely and write no output DNG: only the crop is worked out, from the frames' geometry alone, because the export needs it. Requires `--export-clean` — there would otherwise be nothing to produce — and `--fixed-tripod`, because on a tracked sequence the stack is what every exported frame is levelled against and nothing substitutes for it. |
 
 ### Untracked sequences
 
@@ -907,6 +934,10 @@ export cost at the price of the noise reduction.
 | `src/exif.rs` | Native EXIF: reads the source RAW's identifying and photographic tags and writes them into the DNG by relocating its IFD0. |
 | `src/timelapse.rs` | Clean sequence export: stabilization, deflickering, temporal denoising, transient preservation, dawn ramp. |
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
+| `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
+| `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
+| `.github/workflows/` | Release pipeline: a `v*` tag builds the five archives above and publishes them as a GitHub release. |
+| `.gitea/workflows/` | The same pipeline for a self-hosted Gitea instance, built on one Linux runner — Linux gnu, Linux musl and Windows GNU. macOS is absent there: cross-compiling for Darwin needs Apple's SDK. |
 
 ## Limits
 
