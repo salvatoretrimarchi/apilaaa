@@ -1,0 +1,11 @@
+# One toolchain for everyone: this machine, the GitHub runners and the Gitea
+# runner all resolve to the same rustc through this file, so a build that works
+# in one place is not silently a different compiler somewhere else.
+#
+# The channel floats on current stable rather than pinning a version: this
+# project tracks the newest Rust, and edition 2024 already sets the floor at
+# 1.85. Pin an exact version here if a release ever needs to be reproducible
+# down to the compiler.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
