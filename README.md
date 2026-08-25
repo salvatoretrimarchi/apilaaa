@@ -109,10 +109,10 @@ tar xzf apilaaa-0.1.0-linux-x86_64.tar.gz
 
 Releases come out of `main`: every merge publishes one, with the patch number
 one above the previous release. `apilaaa --version` reports the version of the
-release it came from — the tag is the source of truth, and CI stamps it into
-the manifest at build time, so the number in `Cargo.toml` is only where the
-counter started. A minor or major bump is made by pushing that tag by hand; the
-patch counter carries on from it.
+release it came from — the tag is the source of truth, and CI passes it to the
+compiler in `APILAAA_VERSION`, so the number in `Cargo.toml` is only where the
+counter started and is what a build from source reports. A minor or major bump
+is made by pushing that tag by hand; the patch counter carries on from it.
 
 ## Requirements
 
@@ -448,7 +448,7 @@ entirely — and with it `--export-clean`, which refuses to run without a model.
 | `--max-stars <N>` | `40` | Stars used per frame for alignment. |
 | `--limit <N>` | — | Process at most N frames; useful for quick tests. |
 | `--no-stretch` | off | Keep the native sensor scale instead of baking a stretch. |
-| `-V, --version` | — | Print the version, which is the one in `Cargo.toml` and in the release tag. |
+| `-V, --version` | — | Print the version: the release tag for a published binary, the one in `Cargo.toml` for a build from source. |
 
 ### Defect correction
 
@@ -1026,7 +1026,8 @@ export cost at the price of the noise reduction.
 | `src/ui/wizard.rs` | The setup screen shown when there are no arguments: the options as a form, with the equivalent command line written out as it is edited. |
 | `src/ui/dash.rs` | The live dashboard: run summary, one progress bar per pass, scrollable log, and the stop key. |
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
-| `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
+| `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. Nothing rewrites it at build time. |
+| `build.rs` | Two lines. Registers `APILAAA_VERSION` with Cargo so a release build reports the tag it came from without the manifest or the lockfile being edited. |
 | `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
 | `.github/workflows/` | Release pipeline. A merge into `main` publishes the next patch version; a `v*` tag publishes exactly that version. A manual run builds the same five archives but publishes nothing. |
 | `docs/img/` | The images the README shows. WebP, versioned on purpose: they are the only files under an ignored extension that belong in the repository. |

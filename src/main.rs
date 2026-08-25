@@ -21,8 +21,18 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Instant;
 
+/// What `--version` reports. `CARGO_PKG_VERSION` is the floor the manifest
+/// declares; a release build overrides it with `APILAAA_VERSION`, which is
+/// the tag CI is publishing. Nothing is written back into `Cargo.toml` or
+/// `Cargo.lock` for it, so `--locked` always compares the two files exactly
+/// as they were committed.
+const VERSION: &str = match option_env!("APILAAA_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser, Debug)]
-#[command(version, about = "RAW stacker with translation and rotation correction")]
+#[command(version = VERSION, about = "RAW stacker with translation and rotation correction")]
 pub struct Args {
     /// Directory holding the input RAW files (.ARW)
     #[arg(short, long, default_value = "res")]
