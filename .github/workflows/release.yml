@@ -28,6 +28,9 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Gitea reads .github/workflows too, and its counterpart of this file is
+    # .gitea/workflows/release.yml. This keeps each forge to its own pipeline.
+    if: github.server_url == 'https://github.com'
     strategy:
       # One platform failing should not hide whether the others are fine.
       fail-fast: false
@@ -111,6 +114,7 @@ jobs:
     name: publish the release
     needs: build
     runs-on: ubuntu-latest
+    if: github.server_url == 'https://github.com'
     permissions:
       contents: write
     steps:
