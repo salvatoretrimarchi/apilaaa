@@ -15,7 +15,9 @@ res*/
 *.ORF
 
 # Image outputs. Rendered comparisons are megabytes each and are reproduced
-# from the output DNGs on demand, so none of them belong here.
+# from the output DNGs on demand, so none of them belong here. The README's
+# own figures are the exception and are versioned: they live in `docs/img/`
+# as WebP, which is deliberately not in this list.
 *.tif
 *.tiff
 *.dng
