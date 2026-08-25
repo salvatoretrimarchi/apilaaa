@@ -65,6 +65,13 @@ Each holds the binary, this README and the licence. `SHA256SUMS` alongside them
 covers the set. The Windows and macOS binaries are built by CI but not tested
 there — Linux is the platform this is developed and run on.
 
+Alongside the versioned releases there is a `latest` prerelease, rebuilt from
+the tip of `main` on every merge and carrying the same five archives named
+`apilaaa-main-<target>`. It is where to get a fix before it has been tagged.
+Note that `apilaaa --version` reports whatever is in `Cargo.toml` at that
+point, which is not bumped per merge, so the commit named in the release notes
+is what identifies such a build.
+
 ```sh
 tar xzf apilaaa-0.1.0-x86_64-unknown-linux-gnu.tar.gz
 ./apilaaa-0.1.0-x86_64-unknown-linux-gnu/apilaaa --version
@@ -936,8 +943,8 @@ export cost at the price of the noise reduction.
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
 | `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
 | `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
-| `.github/workflows/` | Release pipeline: a `v*` tag builds the five archives above and publishes them as a GitHub release. |
-| `.gitea/workflows/` | The same pipeline for a self-hosted Gitea instance, built on one Linux runner — Linux gnu, Linux musl and Windows GNU. macOS is absent there: cross-compiling for Darwin needs Apple's SDK. |
+| `.github/workflows/` | Release pipeline. A merge into `main` refreshes the `latest` prerelease; a `v*` tag cuts an immutable versioned release. Both build the same five archives. |
+| `.github/release-identity.sh` | Decides which of those two channels a run belongs to, shared by both jobs so they cannot disagree about what is being published. |
 
 ## Limits
 
