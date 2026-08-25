@@ -71,29 +71,27 @@ jobs:
         shell: bash
         run: bash .github/release-identity.sh
 
-      # The tag is the source of truth for the version, so it is stamped into
-      # the manifest before building and `apilaaa --version` matches the
-      # release it came from. Cargo.lock carries the package's own version too,
-      # and would otherwise make --locked refuse. Neither edit is committed.
-      - name: Stamp the version
-        shell: bash
-        run: |
-          sed -i.bak "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
-          rm -f Cargo.toml.bak
-          python3 - "$VERSION" <<'PY'
-          import io, re, sys
-          v = sys.argv[1]
-          s = io.open("Cargo.lock", encoding="utf-8").read()
-          s, n = re.subn(r'(\[\[package\]\]\nname = "apilaaa"\nversion = )"[^"]+"',
-                         r'\1"%s"' % v, s)
-          assert n == 1, "expected one apilaaa entry in Cargo.lock, found %d" % n
-          io.open("Cargo.lock", "w", encoding="utf-8").write(s)
-          PY
-          grep -m1 '^version = ' Cargo.toml
-
       - name: Install the Rust target
         shell: bash
         run: rustup target add ${{ matrix.target }}
+
+      # Printed per job on purpose. `rust-toolchain.toml` floats on stable, so
+      # the five runners agreeing about which compiler that is cannot be
+      # assumed; when a build fails on one platform and not the others, this
+      # is the first thing worth ruling out.
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      # Separated from the build so that a lockfile the runner disagrees with
+      # fails here, saying so, instead of surfacing as a compile step that
+      # never compiled anything.
+      - name: Fetch the locked dependencies
+        shell: bash
+        run: cargo fetch --locked --target ${{ matrix.target }}
 
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -101,8 +99,15 @@ jobs:
 
       # --locked builds exactly what Cargo.lock pins, vendored rawloader
       # included, so the published binary matches the tree it was built from.
+      # Nothing has edited Cargo.toml or Cargo.lock: the version reaches the
+      # binary through APILAAA_VERSION, which `build.rs` registers with Cargo
+      # and `main.rs` reads with `option_env!`. That is what makes `--locked`
+      # a check of the committed files rather than of a pair of files CI
+      # rewrote seconds earlier.
       - name: Build
         shell: bash
+        env:
+          APILAAA_VERSION: ${{ env.VERSION }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
