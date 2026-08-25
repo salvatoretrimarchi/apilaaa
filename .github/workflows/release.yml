@@ -1,0 +1,141 @@
+name: release
+
+# Tag a commit and the binaries follow:
+#
+#     git tag -a v0.1.0 -m "apilaaa 0.1.0" && git push origin v0.1.0
+#
+# Or run the workflow by hand against a tag that already exists.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release profile in Cargo.toml already sets lto and codegen-units; this
+  # only drops the symbol table, which halves the size of the shipped binary.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide whether the others are fine.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Statically linked against musl: runs on any glibc, including the
+          # older distributions an observatory machine tends to be stuck on.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled from the Apple Silicon runner: the Xcode toolchain
+          # there targets x86_64 natively, so no Intel runner is needed.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # ARM Linux, if you ever want it — the runner label is GA for public
+          # repositories, so this is one uncomment away:
+          # - target: aarch64-unknown-linux-gnu
+          #   os: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve the version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=$tag"          >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}"  >> "$GITHUB_ENV"
+
+      - name: Install the Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # --locked builds exactly what Cargo.lock pins, vendored rawloader
+      # included, so the published binary matches the tagged tree.
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="apilaaa-${VERSION}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/apilaaa" "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "apilaaa-$env:VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/apilaaa.exe" $name
+          Copy-Item README.md, LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
