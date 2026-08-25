@@ -50,32 +50,32 @@ becomes a star-trail image, which is what averaging a fixed sequence means.
 
 ## Install
 
-Every tagged release carries prebuilt archives, so `cargo` is only needed to
-build from source:
+Every release carries prebuilt archives, so `cargo` is only needed to build from
+source:
 
 | Archive | Platform |
 |---|---|
-| `apilaaa-<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux, glibc |
-| `apilaaa-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux, statically linked — independent of the distribution's glibc |
-| `apilaaa-<version>-x86_64-pc-windows-msvc.zip` | Windows |
-| `apilaaa-<version>-aarch64-apple-darwin.tar.gz` | macOS, Apple Silicon |
-| `apilaaa-<version>-x86_64-apple-darwin.tar.gz` | macOS, Intel |
+| `apilaaa-<version>-linux-x86_64.tar.gz` | Linux, glibc |
+| `apilaaa-<version>-linux-x86_64-static.tar.gz` | Linux, statically linked — independent of the distribution's glibc |
+| `apilaaa-<version>-windows-x86_64.zip` | Windows |
+| `apilaaa-<version>-macos-arm64.tar.gz` | macOS, Apple Silicon |
+| `apilaaa-<version>-macos-x86_64.tar.gz` | macOS, Intel |
 
 Each holds the binary, this README and the licence. `SHA256SUMS` alongside them
 covers the set. The Windows and macOS binaries are built by CI but not tested
 there — Linux is the platform this is developed and run on.
 
-Alongside the versioned releases there is a `latest` prerelease, rebuilt from
-the tip of `main` on every merge and carrying the same five archives named
-`apilaaa-main-<target>`. It is where to get a fix before it has been tagged.
-Note that `apilaaa --version` reports whatever is in `Cargo.toml` at that
-point, which is not bumped per merge, so the commit named in the release notes
-is what identifies such a build.
-
 ```sh
-tar xzf apilaaa-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-./apilaaa-0.1.0-x86_64-unknown-linux-gnu/apilaaa --version
+tar xzf apilaaa-0.1.0-linux-x86_64.tar.gz
+./apilaaa-0.1.0-linux-x86_64/apilaaa --version
 ```
+
+Releases come out of `main`: every merge publishes one, with the patch number
+one above the previous release. `apilaaa --version` reports the version of the
+release it came from — the tag is the source of truth, and CI stamps it into
+the manifest at build time, so the number in `Cargo.toml` is only where the
+counter started. A minor or major bump is made by pushing that tag by hand; the
+patch counter carries on from it.
 
 ## Requirements
 
@@ -943,8 +943,8 @@ export cost at the price of the noise reduction.
 | `vendor/rawloader/` | `rawloader` 0.37.2 with `data/cameras/sony/a6400.toml` added, patched in from `Cargo.toml`; the upstream release refuses A6400 files outright. |
 | `Cargo.lock` | Versioned on purpose: this is a binary crate, so the lockfile is what makes a build reproducible and what pins the vendored `rawloader`. |
 | `rust-toolchain.toml` | Pins the toolchain channel to current stable, so a local build and a CI build are the same compiler. |
-| `.github/workflows/` | Release pipeline. A merge into `main` refreshes the `latest` prerelease; a `v*` tag cuts an immutable versioned release. Both build the same five archives. |
-| `.github/release-identity.sh` | Decides which of those two channels a run belongs to, shared by both jobs so they cannot disagree about what is being published. |
+| `.github/workflows/` | Release pipeline. A merge into `main` publishes the next patch version; a `v*` tag publishes exactly that version. A manual run builds the same five archives but publishes nothing. |
+| `.github/release-identity.sh` | Works out the version and whether the run publishes at all, shared by both jobs so they cannot disagree about what is being produced. |
 
 ## Limits
 
