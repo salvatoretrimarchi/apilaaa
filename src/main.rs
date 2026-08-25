@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(about = "RAW stacker with translation and rotation correction")]
+#[command(version, about = "RAW stacker with translation and rotation correction")]
 struct Args {
     /// Directory holding the input RAW files (.ARW)
     #[arg(short, long, default_value = "res")]
