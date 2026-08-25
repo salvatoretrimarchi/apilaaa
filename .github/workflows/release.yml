@@ -1,17 +1,12 @@
 name: release
 
-# Two channels out of one pipeline:
+# Where the binaries come from:
 #
-#   push to main   -> refreshes the `latest` prerelease with the tip's binaries
-#   push a v* tag  -> cuts an immutable release for that version
-#
-# The rolling channel is tagged `latest` rather than `main`, because a
-# refs/tags/main next to refs/heads/main makes every `git checkout main`
-# ambiguous.
-#
-#     git tag -a v0.1.0 -m "apilaaa 0.1.0" && git push origin v0.1.0
-#
-# workflow_dispatch runs the tag channel against a tag that already exists.
+#   push to main        a release, versioned one patch above the highest v* tag
+#   push a v* tag       a release at exactly that version (how a minor or major
+#                       bump is made; the patch counter carries on from it)
+#   manual run          artifacts on the run only — no tag, no release, whatever
+#                       branch was selected
 on:
   push:
     branches:
@@ -19,10 +14,6 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to build and publish (e.g. v0.1.0)"
-        required: true
 
 permissions:
   contents: read
@@ -35,7 +26,7 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     # Gitea mirrors this repository and reads .github/workflows too, where it
     # would find macos runners it cannot schedule. Keep this guard.
@@ -47,33 +38,58 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            label: linux-x86_64
           # Statically linked against musl: runs on any glibc, including the
           # older distributions an observatory machine tends to be stuck on.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            label: linux-x86_64-static
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            label: windows-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
+            label: macos-arm64
           # Cross-compiled from the Apple Silicon runner: the Xcode toolchain
           # there targets x86_64 natively, so no Intel runner is needed.
           - target: x86_64-apple-darwin
             os: macos-latest
+            label: macos-x86_64
           # ARM Linux, if you ever want it — the runner label is GA for public
           # repositories, so this is one uncomment away:
           # - target: aarch64-unknown-linux-gnu
           #   os: ubuntu-24.04-arm
+          #   label: linux-arm64
 
     steps:
+      # Full history and tags: the version is derived from the highest v* tag.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Resolve the channel
         shell: bash
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: bash .github/release-identity.sh
+
+      # The tag is the source of truth for the version, so it is stamped into
+      # the manifest before building and `apilaaa --version` matches the
+      # release it came from. Cargo.lock carries the package's own version too,
+      # and would otherwise make --locked refuse. Neither edit is committed.
+      - name: Stamp the version
+        shell: bash
+        run: |
+          sed -i.bak "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          python3 - "$VERSION" <<'PY'
+          import io, re, sys
+          v = sys.argv[1]
+          s = io.open("Cargo.lock", encoding="utf-8").read()
+          s, n = re.subn(r'(\[\[package\]\]\nname = "apilaaa"\nversion = )"[^"]+"',
+                         r'\1"%s"' % v, s)
+          assert n == 1, "expected one apilaaa entry in Cargo.lock, found %d" % n
+          io.open("Cargo.lock", "w", encoding="utf-8").write(s)
+          PY
+          grep -m1 '^version = ' Cargo.toml
 
       - name: Install the Rust target
         shell: bash
@@ -93,7 +109,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          name="apilaaa-${VERSION}-${{ matrix.target }}"
+          name="apilaaa-${VERSION}-${{ matrix.label }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/apilaaa" "$name/"
           cp README.md LICENSE "$name/"
@@ -104,7 +120,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "apilaaa-$env:VERSION-${{ matrix.target }}"
+          $name = "apilaaa-$env:VERSION-${{ matrix.label }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/apilaaa.exe" $name
           Copy-Item README.md, LICENSE $name
@@ -113,7 +129,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.label }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
           retention-days: 7
@@ -122,17 +138,19 @@ jobs:
     name: publish the release
     needs: build
     runs-on: ubuntu-latest
-    if: github.server_url == 'https://github.com'
+    # A manual run stops at the artifacts above: it can be launched from any
+    # branch, and only main and tags are allowed to publish.
+    if: >-
+      github.server_url == 'https://github.com' &&
+      github.event_name != 'workflow_dispatch'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Resolve the channel
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: bash .github/release-identity.sh
 
       - uses: actions/download-artifact@v4
@@ -147,28 +165,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$CHANNEL" = "rolling" ]; then
-            # Delete and recreate so the tag moves to the new tip. The release
-            # is a prerelease, which keeps GitHub's "Latest" label on the real
-            # versioned releases rather than on this one.
-            gh release delete "$TAG" --yes --cleanup-tag || true
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run of an already published version: replace the assets
+            # rather than letting Gitea-style suffixed duplicates accumulate.
+            gh release upload "$TAG" dist/* --clobber
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
             gh release create "$TAG" dist/* \
-              --prerelease \
-              --target "$GITHUB_SHA" \
-              --title "Latest build from main" \
-              --notes "Built from \`$GITHUB_SHA\` on $(date -u +%Y-%m-%dT%H:%M:%SZ).
-
-          These binaries track the tip of \`main\` and are replaced on every
-          merge. \`apilaaa --version\` reports the version in \`Cargo.toml\`,
-          which is not bumped per merge — the commit above is what identifies
-          this build. For a fixed version, use a \`v*\` release."
+              --title "$TAG" --generate-notes --verify-tag
           else
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release upload "$TAG" dist/* --clobber
-            else
-              gh release create "$TAG" dist/* \
-                --title "$TAG" \
-                --generate-notes \
-                --verify-tag
-            fi
+            # Pushed from main: the tag does not exist yet and is created here,
+            # pointing at the commit that was actually built.
+            gh release create "$TAG" dist/* \
+              --title "$TAG" --generate-notes --target "$GITHUB_SHA"
           fi

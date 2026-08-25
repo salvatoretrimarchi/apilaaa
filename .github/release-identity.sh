@@ -1,32 +1,49 @@
 #!/usr/bin/env bash
-# Decides which of the two release channels this run belongs to, and exports
-# the tag and version every later step uses. Shared by both jobs so they cannot
-# disagree about what is being published.
+# Works out what this run publishes, if anything, and exports it for every
+# later step. Both jobs source this, so the build and the publish cannot
+# disagree about what is being produced.
+#
+#   push to main            release, version = next patch after the highest v* tag
+#   push a v* tag           release, version = that tag
+#   workflow_dispatch       artifacts only, no tag and no release
 set -euo pipefail
 
-if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-  tag="${INPUT_TAG:-}"
-  [ -n "$tag" ] || { echo "workflow_dispatch needs a tag input" >&2; exit 1; }
-  channel=tag
-elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-  tag="${GITHUB_REF_NAME}"
-  channel=tag
-else
-  # A push to main: one rolling prerelease, always overwritten.
-  tag="latest"
-  channel=rolling
-fi
+manifest_version() {
+  # The first version = line in Cargo.toml is the package's own.
+  grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/'
+}
 
-if [ "$channel" = "tag" ]; then
-  version="${tag#v}"
+if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+  # A manual build of whatever branch was selected. Nothing is published, so
+  # the version is only a label on the artifacts.
+  channel=artifacts
+  version="$(manifest_version)"
+elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+  # An explicit tag is how a minor or major bump is made; the patch counter
+  # below carries on from it.
+  channel=release
+  version="${GITHUB_REF_NAME#v}"
 else
-  version="main"
+  channel=release
+  latest="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+  if [ -z "$latest" ]; then
+    # Nothing released yet: start from whatever the manifest declares.
+    version="$(manifest_version)"
+  else
+    base="${latest#v}"
+    major="${base%%.*}"
+    rest="${base#*.}"
+    minor="${rest%%.*}"
+    patch="${rest#*.}"
+    patch="${patch%%[-+]*}"
+    version="${major}.${minor}.$((patch + 1))"
+  fi
 fi
 
 {
   echo "CHANNEL=$channel"
-  echo "TAG=$tag"
   echo "VERSION=$version"
+  echo "TAG=v$version"
 } >> "$GITHUB_ENV"
 
-echo "channel=$channel tag=$tag version=$version"
+echo "channel=$channel version=$version tag=v$version"
