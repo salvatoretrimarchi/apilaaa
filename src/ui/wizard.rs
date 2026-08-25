@@ -784,15 +784,14 @@ impl Form {
                     if !note.is_empty() {
                         spans.push(Span::styled(note, dim()));
                     }
+                    // The frame count belongs on the directory's own row and
+                    // stays there whether or not that row has the cursor: it
+                    // is a fact about the run, not about the focused field.
+                    if *id == Id::Input && !editing {
+                        spans.push(frames.clone());
+                    }
                     lines.push(Line::from(spans));
                 }
-            }
-        }
-        // The frame count belongs next to the directory it counted, and
-        // that row is not always on screen.
-        if let Some(Row::Field(Id::Input)) = rows.get(self.cursor) {
-            if let Some(l) = lines.get_mut(self.cursor - self.top) {
-                l.spans.push(frames);
             }
         }
         f.render_widget(Paragraph::new(lines), inner);
