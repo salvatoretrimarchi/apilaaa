@@ -74,33 +74,28 @@ right panel is the same data with the defect model subtracted **in sensor
 coordinates, before averaging**, which is the one order of operations that can
 tell the two apart.
 
-**A single frame, on a fixed tripod, under heavy light pollution.** The
-timelapse export runs the same model over every frame of the session.
+**A single frame, on a fixed tripod, under a light dome.** 937 frames of 5 s at
+ISO 6400 from a Canon EOS 6D and an EF 50 mm f/1.4, 01:55 to 03:49, with lit
+cloud crossing the sky for part of the night. The timelapse export runs the
+session's model over every one of them; this is one of them.
 
-![A milky, light-polluted 25 s frame next to the same frame cleaned, showing the Milky Way](docs/img/frame-cleaned.webp)
+![A 5 s frame washed out by the light dome, next to the same frame cleaned: a flat sky full of stars, with Andromeda and the cloud still in it](docs/img/fixed-frame.webp)
 
-This is one 25-second exposure, not a stack. What comes back is not a
-brightness adjustment: the light dome, the vignetting and the frame's own
-gradient are each modelled and removed, and what was underneath them survives.
-Every frame of the sequence gets the same treatment, which is what makes the
-exported timelapse hold still instead of pulsing.
+This is one 5-second exposure, not a stack. What comes back is not a brightness
+adjustment: the light dome, the vignetting and the frame's own gradient are each
+modelled and removed, and what was underneath them survives — the stars, the
+dust lanes, Andromeda near the centre. Every frame of the sequence gets the same
+treatment, which is what makes the exported timelapse hold still instead of
+pulsing.
 
-**A fixed tripod with weather in it.** 937 frames of 5 s at ISO 6400, Canon
-EOS 6D and an EF 50 mm f/1.4, from 01:55 to 03:49 under a light dome that
-covers half the frame — and with lit cloud crossing the sky for part of the
-night.
-
-![A 5 s frame with the light dome washing out the left of the sky, next to the same frame cleaned: flat sky, the same cloud still there](docs/img/fixed-frame.webp)
-
-Cloud is the hard case, and it is the reason the untracked path exists in the
-form it does. A cloud lit from below is smooth, lopsided and far brighter than
-the sky around it — the same description as a lens halo or a flare wedge — so
-anything that separates defect from sky by shape alone puts the cloud in the
-defect model and then subtracts it from every frame of the night, including the
-ones where that patch of sky was clear. Here it is separated by what is behind
-it instead: the stars come through stray light and do not come through cloud.
-The cloud stays in the frame, at its own brightness; the dome underneath it
-does not.
+Cloud is the hard case, and it is the reason the untracked path is built the way
+it is. A cloud lit from below is smooth, lopsided and far brighter than the sky
+around it — the same description as a lens halo or a flare wedge — so anything
+that separates defect from sky by shape alone puts the cloud in the defect model
+and then subtracts it from every frame of the night, including the ones where
+that patch of sky was clear. Here it is separated by what is behind it instead:
+the stars come through stray light and do not come through cloud. The cloud
+stays in the frame at its own brightness; the dome underneath it does not.
 
 Measured on the cells of that session no cloud ever touched, the background of
 the stack goes from **22.5 % peak-to-peak to 0.74 %** — and over the same
