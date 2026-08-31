@@ -56,6 +56,25 @@ fn median_mad_channel(rgb: &[f32], channel: usize) -> (f32, f32) {
 pub struct StretchParams {
     pub white: [f32; 3],
     pub blacks: [f32; 3],
+    /// The background the ends were placed around, per channel, in the input
+    /// scale. Kept so the run can report where it lands once stretched,
+    /// which is the number the neutrality of the file rests on.
+    pub median: [f32; 3],
+}
+
+impl StretchParams {
+    /// Where each channel's background lands in the output range, as a
+    /// fraction: `(median − black) / (white − black)`. The three are equal by
+    /// construction (see `analyze_stretch`), so this is the level the sky
+    /// comes out at whatever colour the night was.
+    pub fn background_level(&self) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            let span = self.white[c] - self.blacks[c];
+            out[c] = if span > 1e-9 { (self.median[c] - self.blacks[c]) / span } else { 0.0 };
+        }
+        out
+    }
 }
 
 /// `WHITE` at 99.9 saturates only the brightest 0.1% of each channel.
@@ -68,26 +87,63 @@ pub struct StretchParams {
 /// bias and pure noise but preserves sky, milky way and nebula.
 const WHITE_PERCENTILE: f32 = 99.9;
 const BLACKS_K_MAD: f32 = 3.0;
+/// Ceiling on the margin below the background, in units of the span between
+/// the background and the white point. Reached only by an image with almost
+/// no highlights above its own sky — there is no stretch worth writing for
+/// that, and this stops the black point from running away below zero.
+const BLACKS_MAX_SPAN: f32 = 1.0;
 
 /// Analyses an interleaved RGB buffer and returns the stretch parameters.
-/// It is applied to the final stack (already balanced via `frame.wb` in
-/// `stack::add`) so that the per-channel peaks fall in comparable ranges.
+///
+/// The buffer is already white-balanced (`frame.wb`, baked in `stack::add`),
+/// but a camera's white balance is a statement about daylight, not about the
+/// light the sky was actually under. What the pipeline preserves on purpose —
+/// the pedestal, the sky's own level — carries that light's colour, and a
+/// per-channel stretch that treats each channel on its own terms leaves it
+/// there: on the Canon test session the background came out at 7.6 % of the
+/// range in red, 4.9 % in green and 10.2 % in blue, which is not a stretch
+/// artefact but a cast, and one no global curve in a raw developer can undo
+/// because it lives in the black points.
+///
+/// So the two ends are chosen to say the same thing in all three channels.
+/// Each channel's white point still saturates the brightest 0.1 % of itself,
+/// and each black point is placed so that the **background lands at the same
+/// height in the output range for R, G and B**:
+///
+/// ```text
+/// black_c = median_c − s · (white_c − median_c)
+/// ```
+///
+/// with a single `s` shared by the three. That `s` is the largest any channel
+/// needs to keep its `BLACKS_K_MAD` margin below its own background, so no
+/// channel is clipped more tightly than it would have been on its own, and
+/// the two that needed less simply keep more of their skirt. What comes out
+/// is neutral by construction: the sky sits at one level, the stars keep the
+/// colour they had relative to it, and the developer opens a file whose
+/// channels are already aligned.
 pub fn analyze_stretch(rgb: &[f32]) -> StretchParams {
-    let (m0, mad0) = median_mad_channel(rgb, 0);
-    let (m1, mad1) = median_mad_channel(rgb, 1);
-    let (m2, mad2) = median_mad_channel(rgb, 2);
-    StretchParams {
-        white: [
-            percentile_channel(rgb, 0, WHITE_PERCENTILE),
-            percentile_channel(rgb, 1, WHITE_PERCENTILE),
-            percentile_channel(rgb, 2, WHITE_PERCENTILE),
-        ],
-        blacks: [
-            (m0 - BLACKS_K_MAD * mad0).max(0.0),
-            (m1 - BLACKS_K_MAD * mad1).max(0.0),
-            (m2 - BLACKS_K_MAD * mad2).max(0.0),
-        ],
+    let mut median = [0.0f32; 3];
+    let mut mad = [0.0f32; 3];
+    let mut white = [0.0f32; 3];
+    for c in 0..3 {
+        let (m, d) = median_mad_channel(rgb, c);
+        median[c] = m;
+        mad[c] = d;
+        white[c] = percentile_channel(rgb, c, WHITE_PERCENTILE);
     }
+    let mut span = 0.0f32;
+    for c in 0..3 {
+        let above = white[c] - median[c];
+        if above > 1e-9 {
+            span = span.max(BLACKS_K_MAD * mad[c] / above);
+        }
+    }
+    let span = span.min(BLACKS_MAX_SPAN);
+    let mut blacks = [0.0f32; 3];
+    for c in 0..3 {
+        blacks[c] = (median[c] - span * (white[c] - median[c])).max(0.0);
+    }
+    StretchParams { white, blacks, median }
 }
 
 /// The camera's XYZ→camera matrix (D65) as the nine SRATIONALs the DNG
@@ -170,13 +226,15 @@ fn write_dng_impl(
         65535.0 / (white[1] - blacks[1]).max(1e-6),
         65535.0 / (white[2] - blacks[2]).max(1e-6),
     ];
-    if verbose && stretch.is_some() {
+    if verbose && let Some(st) = stretch {
         let pct = |c: usize| 100.0 * blacks[c] / white[c];
+        let bg = st.background_level();
         say!(
-            "stretch: white=R {:.6} G {:.6} B {:.6}  blacks=R {:.6} G {:.6} B {:.6} ({:.1}% / {:.1}% / {:.1}% of the range)",
+            "stretch: white=R {:.6} G {:.6} B {:.6}  blacks=R {:.6} G {:.6} B {:.6} ({:.1}% / {:.1}% / {:.1}% of the range); background at {:.1}% / {:.1}% / {:.1}% — the three aligned",
             white[0], white[1], white[2],
             blacks[0], blacks[1], blacks[2],
-            pct(0), pct(1), pct(2)
+            pct(0), pct(1), pct(2),
+            100.0 * bg[0], 100.0 * bg[1], 100.0 * bg[2]
         );
     }
 
