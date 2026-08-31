@@ -118,6 +118,40 @@ impl SourceExif {
     }
 }
 
+/// When the frame was taken, in seconds, from `DateTimeOriginal` (or
+/// `DateTime` if that is all there is).
+///
+/// The zero point is arbitrary — only differences are ever asked for — so
+/// the civil date is turned into days with the usual proleptic-Gregorian
+/// count and no timezone is applied. A session that crosses midnight or a
+/// DST change is still monotonic in the only sense that matters here.
+pub fn capture_seconds(path: &Path) -> Option<f64> {
+    let src = read_source(path).ok()?;
+    let text = |list: &[(u16, Value)], tag: u16| -> Option<String> {
+        list.iter().find(|(t, _)| *t == tag).and_then(|(_, v)| match v {
+            Value::Ascii(b) => Some(String::from_utf8_lossy(b).trim_end_matches('\0').trim().to_string()),
+            _ => None,
+        })
+    };
+    let s = text(&src.exif, 36867)
+        .or_else(|| text(&src.exif, 36868))
+        .or_else(|| text(&src.ifd0, 306))?;
+    // "YYYY:MM:DD HH:MM:SS"
+    let b = s.as_bytes();
+    if b.len() < 19 { return None; }
+    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.trim().parse::<i64>().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, se) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    // Days from the civil date (the usual days_from_civil).
+    let y2 = y - if mo <= 2 { 1 } else { 0 };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + h * 3600 + mi * 60 + se) as f64)
+}
+
 const TAG_MODEL: u16 = 272;
 const TAG_LENS_MODEL: u16 = 42036;
 const TAG_EXIF_IFD: u16 = 34665;

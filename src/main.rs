@@ -352,7 +352,7 @@ fn run(args: Args) -> Result<()> {
             }
             drift_template = Some(tpl);
         }
-        infos.push(FrameInfo { idx: 0, m: Similarity::identity(), bg, mask, level, in_stack: true, aligned: true, inliers: usize::MAX, export: true });
+        infos.push(FrameInfo { idx: 0, m: Similarity::identity(), bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers: usize::MAX, export: true });
     }
     drop(lum_ref);
     drop(ref_frame);
@@ -510,7 +510,7 @@ fn run(args: Args) -> Result<()> {
                             String::from(if args.fixed_no_stabilize { "identity" } else { "drift not measurable, identity" }),
                         ),
                     };
-                    infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers: n_stars, export: true });
+                    infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers: n_stars, export: true });
                     aligned += 1;
                     say!(
                         "  [{}/{}] {}: {} stars, {}, sky {:.4} in {:.2}s",
@@ -534,7 +534,7 @@ fn run(args: Args) -> Result<()> {
                     match (fit, bg) {
                         (Some((m, inliers)), Some((bg, mask, level))) if inliers >= MIN_INLIERS => {
                             let fg = mask.fraction();
-                            infos.push(FrameInfo { idx, m, bg, mask, level, in_stack: true, aligned: true, inliers, export: true });
+                            infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers, export: true });
                             aligned += 1;
                             say!(
                                 "  [{}/{}] {}: {} stars, {} inliers, θ={:.3}°, t=({:.2},{:.2}), sky {:.4}{} in {:.2}s",
@@ -562,7 +562,8 @@ fn run(args: Args) -> Result<()> {
                                 inl
                             );
                             pending.push(FrameInfo {
-                                idx, m: Similarity::identity(), bg, mask, level, in_stack: false, aligned: false, inliers: inl, export: true,
+                                idx, m: Similarity::identity(), bg, fit_mask: mask.clone(), mask, cloud: 0.0,
+                                level, in_stack: false, in_model: false, aligned: false, inliers: inl, export: true,
                             });
                         }
                         (_, None) => unreachable!(),
@@ -661,8 +662,35 @@ fn run(args: Args) -> Result<()> {
             );
             for f in infos.iter_mut() {
                 f.mask = consensus.clone();
-                f.level = flatten::sky_level(&f.bg, &f.mask);
             }
+            // What the landscape mask cannot answer: which cells this
+            // particular frame had cloud over. The landscape is the same in
+            // every frame and the model has to keep it out; a cloud is in
+            // one frame and not the next, and the model has to keep it out
+            // too — for the opposite reason.
+            let tc = Instant::now();
+            let maps: Vec<flatten::BgMap> = infos.iter().map(|f| f.bg.clone()).collect();
+            let clouds = flatten::cloud_masks(&maps, &consensus);
+            if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
+                flatten::debug_dump_masks(&maps, &consensus, &clouds, Path::new(&dir))?;
+            }
+            drop(maps);
+            let mut n_clouded = 0usize;
+            let mut cover: Vec<f32> = Vec::with_capacity(infos.len());
+            for (f, c) in infos.iter_mut().zip(clouds) {
+                f.cloud = c.fraction();
+                if f.cloud > CLOUD_REPORT_FRAC { n_clouded += 1; }
+                cover.push(f.cloud);
+                f.fit_mask = flatten::union_mask(&f.mask, &c);
+                f.level = flatten::sky_level(&f.bg, &f.fit_mask);
+            }
+            cover.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            say!(
+                "cloud: {} of {} frames with more than {:.0}% covered (median cover {:.1}%, worst {:.1}%) in {:.1}s — those cells enter no fit",
+                n_clouded, cover.len(), 100.0 * CLOUD_REPORT_FRAC,
+                100.0 * cover[cover.len() / 2], 100.0 * cover[cover.len() - 1],
+                tc.elapsed().as_secs_f32()
+            );
         }
         if needs_sky_chain && stars_ref.len() >= 6 {
             let tc = Instant::now();
@@ -739,6 +767,7 @@ fn run(args: Args) -> Result<()> {
         let mut n_fg = 0usize;
         let mut n_bright = 0usize;
         let mut n_dark = 0usize;
+        let mut n_cloud = 0usize;
         let mut n_with_fg = 0usize;
         let mut n_sat = 0usize;
         for f in infos.iter_mut() {
@@ -754,6 +783,9 @@ fn run(args: Args) -> Result<()> {
             } else if f.mask.fraction() > max_fg {
                 f.in_stack = false;
                 n_fg += 1;
+            } else if f.cloud > CLOUD_MAX_FRAC {
+                f.in_stack = false;
+                n_cloud += 1;
             } else if med_level > 0.0 && f.level > med_level * tol {
                 f.in_stack = false;
                 n_bright += 1;
@@ -764,8 +796,9 @@ fn run(args: Args) -> Result<()> {
         }
         let n_stack = infos.iter().filter(|f| f.in_stack).count();
         say!(
-            "stack selection: {} of {} aligned frames (median sky {:.4}, tolerance ×{:.2}); {} with foreground (masked); excluded: {} for foreground > {:.0}%, {} for bright sky, {} for dark sky; {} with saturated sky (≥ {:.0}%) are not exported",
-            n_stack, infos.len(), med_level, tol, n_with_fg, n_fg, 100.0 * max_fg, n_bright, n_dark, n_sat, 100.0 * EXPORT_MAX_LEVEL
+            "stack selection: {} of {} aligned frames (median sky {:.4}, tolerance ×{:.2}); {} with foreground (masked); excluded: {} for foreground > {:.0}%, {} for cloud > {:.0}%, {} for bright sky, {} for dark sky; {} with saturated sky (≥ {:.0}%) are not exported",
+            n_stack, infos.len(), med_level, tol, n_with_fg, n_fg, 100.0 * max_fg,
+            n_cloud, 100.0 * CLOUD_MAX_FRAC, n_bright, n_dark, n_sat, 100.0 * EXPORT_MAX_LEVEL
         );
         if n_stack == 0 {
             return Err(anyhow!("no frame passes the stack selection (tune --stack-sky-tolerance / --stack-max-foreground)"));
@@ -775,6 +808,44 @@ fn run(args: Args) -> Result<()> {
                 say!("  excluded from the stack: {} (sky {:.4}, foreground {:.1}%)",
                     paths[f.idx].file_name().unwrap().to_string_lossy(), f.level, 100.0 * f.mask.fraction());
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Which frames are allowed to say what the background is. Every frame
+    // that is stacked, minus the ones with cloud in them: a cloud is the one
+    // thing in the sky that looks like a defect from a single frame, and the
+    // only way to be sure it never enters the model is to not let a doubtful
+    // frame near it.
+    // ---------------------------------------------------------------
+    {
+        for f in infos.iter_mut() {
+            f.in_model = f.in_stack && f.cloud <= CLOUD_FIT_FRAC;
+        }
+        let mut n_model = infos.iter().filter(|f| f.in_model).count();
+        let n_candidates = infos.iter().filter(|f| f.in_stack).count();
+        if n_model < MODEL_MIN_FRAMES.min(n_candidates) {
+            // Every frame of this session has some cloud in it. Take the
+            // clearest ones rather than none: a background measured on the
+            // least clouded frames of a clouded night is still the best
+            // answer available, and it is said out loud.
+            let mut order: Vec<usize> = (0..infos.len()).filter(|&i| infos[i].in_stack).collect();
+            order.sort_by(|&a, &b| infos[a].cloud.partial_cmp(&infos[b].cloud).unwrap());
+            let keep = MODEL_MIN_FRAMES.min(order.len());
+            for &i in &order[..keep] { infos[i].in_model = true; }
+            n_model = infos.iter().filter(|f| f.in_model).count();
+            say!(
+                "  WARNING: only {} frames are clear of cloud; the background is determined from the {} least clouded instead (up to {:.0}% cover)",
+                infos.iter().filter(|f| f.in_stack && f.cloud <= CLOUD_FIT_FRAC).count(),
+                n_model,
+                100.0 * order[..keep].iter().map(|&i| infos[i].cloud).fold(0.0, f32::max)
+            );
+        }
+        if untracked {
+            say!(
+                "background from {} of {} stacked frames (cloud ≤ {:.0}%)",
+                n_model, n_candidates, 100.0 * CLOUD_FIT_FRAC
+            );
         }
     }
 
@@ -797,9 +868,9 @@ fn run(args: Args) -> Result<()> {
     let flat = if !untracked {
         flatten::FlatField::flat(1, 1, flatten::BLOCK, 1.0)
     } else {
-        let sel: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_stack).collect();
+        let sel: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_model).collect();
         let maps: Vec<flatten::BgMap> = sel.iter().map(|f| f.bg.clone()).collect();
-        let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.mask.clone()).collect();
+        let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.fit_mask.clone()).collect();
         let levels: Vec<f32> = sel.iter().map(|f| f.level).collect();
         flatten::fit_flat_field(&maps, &masks, &levels)
     };
@@ -808,10 +879,46 @@ fn run(args: Args) -> Result<()> {
     }
     if flat.usable {
         for f in infos.iter_mut() {
-            flat.apply_map(&mut f.bg);
-            f.level = flatten::sky_level(&f.bg, &f.mask);
+            let mask = f.fit_mask.clone();
+            flat.apply_map(&mut f.bg, &mask);
+            f.level = flatten::sky_level(&f.bg, &f.fit_mask);
         }
     }
+
+    // How far the sky turned between the two halves of an untracked
+    // session, at half the frame's radius: the lever the residual surface's
+    // verification works with. The sky turns once a sidereal day, and a
+    // point at radius r from the pole moves r·Δθ; taking r from the image
+    // centre understates that whenever the pole is off frame, which is the
+    // safe direction to be wrong in.
+    let sky_motion_px = if untracked {
+        let used: Vec<usize> = infos.iter().filter(|f| f.in_model).map(|f| f.idx).collect();
+        match (used.first(), used.last()) {
+            (Some(&a), Some(&b)) if b > a => {
+                match (exif::capture_seconds(&paths[a]), exif::capture_seconds(&paths[b])) {
+                    (Some(ta), Some(tb)) => {
+                        // The two halves sit, on average, half a session apart.
+                        let half = (tb - ta).abs() * 0.5;
+                        let omega = std::f64::consts::TAU / 86_164.0; // sidereal day
+                        let r_half = 0.25 * ((w_ref * w_ref + h_ref * h_ref) as f32).sqrt();
+                        let px = (half * omega) as f32 * r_half;
+                        say!(
+                            "sky motion between the halves of the session: {:.0} px at r={:.0} px ({:.0} min apart)",
+                            px, r_half, half / 60.0
+                        );
+                        px
+                    }
+                    _ => {
+                        say!("  no capture time in the frames: the residual surface cannot be verified against the session");
+                        0.0
+                    }
+                }
+            }
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
 
     let stack_infos: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_stack).collect();
     let stack_transforms: Vec<Similarity> = stack_infos.iter().map(|f| f.m).collect();
@@ -820,7 +927,7 @@ fn run(args: Args) -> Result<()> {
         let _ = label;
         let tf = Instant::now();
         let maps: Vec<flatten::BgMap> = sel.iter().map(|f| f.bg.clone()).collect();
-        let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.mask.clone()).collect();
+        let masks: Vec<flatten::CellMask> = sel.iter().map(|f| f.fit_mask.clone()).collect();
         let (bg, filled) = flatten::temporal_median_masked(&maps, &masks);
         if filled > 0 {
             say!("  [{label}] {} map cells always covered, filled in from neighbours", filled);
@@ -832,9 +939,26 @@ fn run(args: Args) -> Result<()> {
             fs::create_dir_all(&sub)?;
             flatten::debug_dump_halves(&maps, &tfs, &idxs, &sub)?;
         }
+        // The same maps, split down the middle of the session: what both
+        // halves see in the same sensor cells is background, and what only
+        // one of them sees is sky that moved on.
+        let halves = if untracked && maps.len() >= 2 * MIN_HALF_FRAMES && sky_motion_px > 0.0 {
+            let h = maps.len() / 2;
+            let (a, _) = flatten::temporal_median_masked(&maps[..h], &masks[..h]);
+            let (b, _) = flatten::temporal_median_masked(&maps[h..], &masks[h..]);
+            Some((a, b))
+        } else {
+            None
+        };
         drop(maps);
         drop(masks);
-        let mut model = flatten::GlareModel::fit(&bg, w_ref, h_ref, !args.no_residual_surface);
+        let mut model = flatten::GlareModel::fit(
+            &bg,
+            w_ref,
+            h_ref,
+            !args.no_residual_surface,
+            halves.as_ref().map(|(a, b)| (a, b, sky_motion_px)),
+        );
         model.flat = if flat.usable { Some(flat.clone()) } else { None };
         say!("glare/gradient [{label}]: {}", model.report());
         if let Some(dir) = std::env::var_os("APILAAA_DEBUG_DIR") {
@@ -863,7 +987,8 @@ fn run(args: Args) -> Result<()> {
     // absorbs whatever that frame has more or less of compared to that
     // median (horizon glow, twilight, halo amplitude).
     ui::phase("fitting the halo + gradient model");
-    let stack_model = if flatten_on { Some(fit_model(&stack_infos, "stack")?) } else { None };
+    let model_infos: Vec<&FrameInfo> = infos.iter().filter(|f| f.in_model).collect();
+    let stack_model = if flatten_on { Some(fit_model(&model_infos, "stack")?) } else { None };
     check_abort()?;
 
     // ---------------------------------------------------------------
@@ -923,7 +1048,7 @@ fn run(args: Args) -> Result<()> {
                                 }
                                 let img = match model {
                                     Some((bg_med, m)) => {
-                                        let fc = flatten::fit_frame_corr_ex(&info.bg, bg_med, m, Some(&info.mask), anomaly);
+                                        let fc = flatten::fit_frame_corr_ex(&info.bg, bg_med, m, Some(&info.fit_mask), anomaly);
                                         flatten::clean_frame(m, &frame, Some(&fc), false, scatter_comp)
                                     }
                                     None => {
@@ -1030,7 +1155,7 @@ fn run(args: Args) -> Result<()> {
         );
         let frame = raw::load(&paths[rep.idx])
             .with_context(|| format!("loading the stack's levels reference {}", paths[rep.idx].display()))?;
-        let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.mask), anomaly);
+        let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.fit_mask), anomaly);
         let img = flatten::clean_frame(model, &frame, Some(&fc), true, args.scatter_comp);
         Some(output::analyze_stretch(&img))
     } else {
@@ -1125,7 +1250,7 @@ fn run(args: Args) -> Result<()> {
             );
             let frame = raw::load(&paths[rep.idx])
                 .with_context(|| format!("loading the levels reference {}", paths[rep.idx].display()))?;
-            let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.mask), anomaly);
+            let fc = flatten::fit_frame_corr_ex(&rep.bg, bg_med, model, Some(&rep.fit_mask), anomaly);
             let img = flatten::clean_frame(model, &frame, Some(&fc), true, args.scatter_comp);
             drop(frame);
             let (img, pmask) = if stabilize {
@@ -1180,10 +1305,23 @@ pub struct FrameInfo {
     pub bg: flatten::BgMap,
     /// Per-cell foreground mask (sensor).
     pub mask: flatten::CellMask,
+    /// The cells that take no part in any fit: the foreground, plus — on an
+    /// untracked sequence — whatever cloud covered this frame. The
+    /// foreground alone is what the export and the stack still use, because
+    /// the landscape is part of the picture and a cloud is part of the
+    /// frame; it is only the *model* that neither may enter.
+    pub fit_mask: flatten::CellMask,
+    /// Fraction of the frame this frame's cloud covers.
+    pub cloud: f32,
     /// Sky level (median G of the map without foreground).
     pub level: f32,
-    /// Whether it enters the stack and the model fit.
+    /// Whether it enters the stack.
     pub in_stack: bool,
+    /// Whether it helps determine the background: the flat field, the
+    /// session median map and the model fitted over it. A frame with cloud
+    /// in it is still stacked and still exported — it is only barred from
+    /// saying what the sky underneath looks like.
+    pub in_model: bool,
     /// true = similarity fitted from stars; false = interpolated from the
     /// neighbours (exported only).
     pub aligned: bool,
@@ -1192,6 +1330,35 @@ pub struct FrameInfo {
     /// sky — saturated dawn/twilight — where cleaning makes no sense).
     pub export: bool,
 }
+
+/// Cloud cover above which a frame is counted as clouded in the report.
+const CLOUD_REPORT_FRAC: f32 = 0.05;
+/// Cloud cover above which a frame no longer helps determine the
+/// background.
+///
+/// Deliberately close to zero. A cell-by-cell mask is the right instrument
+/// for the export, where every frame has to be cleaned whatever the weather
+/// put in front of it, but not for the model: there the question is not "how
+/// much of this frame is cloud" but "is this frame *certainly* clear", and
+/// a detector answering the first question wrongly on 2 % of the cells is
+/// answering the second one with a no. Frames enough are left — a night of
+/// timelapse is hundreds — so doubt is cheap to act on and expensive to
+/// ignore: what a wrongly kept frame does is put its cloud in the session
+/// median, from where it is subtracted out of every frame of the night.
+const CLOUD_FIT_FRAC: f32 = 0.02;
+/// Fewest frames each half of the session needs for its own median map to
+/// mean anything (see the residual surface's verification).
+const MIN_HALF_FRAMES: usize = 8;
+/// Fewest frames the background may be determined from before the threshold
+/// above is given up on and the cleanest frames are taken instead. Two
+/// dozen is what the flat field's per-cell regression needs to have a
+/// median at all (`FLAT_MIN_SAMPLES` in either half).
+const MODEL_MIN_FRAMES: usize = 24;
+/// Cloud cover above which a frame no longer takes part in the model or the
+/// stack. What is left of its sky is too little to measure a level on, and
+/// the level is what every per-frame correction is scaled by. It is still
+/// exported: cleaning it with the session's model is exactly what it needs.
+const CLOUD_MAX_FRAC: f32 = 0.5;
 
 /// Sky level (fraction of the sensor range, balanced scale) above which a
 /// frame is considered saturated and is not exported.
