@@ -901,27 +901,16 @@ pub fn export_sequence(
     let crop_in = Similarity::translation(x0 as f32, y0 as f32);
     let crop_out = Similarity::translation(-(x0 as f32), -(y0 as f32));
 
-    // List of exportable frames in chronological order (the aligned ones;
-    // without stabilization all of them are exported and the unaligned ones
-    // go without a mask). End of the sequence: once the frame goes in its
-    // natural version (full dawn, ratio ≥ DAWN_R1) and its sky is above the
-    // stretch white, the DNG would come out entirely white.
-    let white_g = opts.stretch.map_or(f32::INFINITY, |s| s.white[1]);
-    let med_level = {
-        let mut v: Vec<f32> = infos.iter().filter(|f| f.aligned && f.level > 0.0).map(|f| f.level).collect();
-        if v.is_empty() { 0.0 } else {
-            let k = v.len() / 2;
-            let (_, m, _) = v.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
-            *m
-        }
-    };
+    // Every frame of the sequence, in chronological order. An export is a
+    // sequence before it is a set of files: a frame missing from the middle
+    // of one is a jump the viewer sees and an off-by-one in whatever encodes
+    // it, so the bar for leaving one out is not "this frame is poor" but
+    // "there is no image here at all". Only a frame that could not be read
+    // from disk clears that bar, and the run says which.
     let order: Vec<usize> = (0..paths.len())
-        .filter(|i| match by_idx.get(i) {
-            Some(f) => f.export && !(f.level >= white_g && med_level > 0.0 && f.level / med_level >= DAWN_R1),
-            None => !opts.stabilize,
-        })
+        .filter(|i| by_idx.contains_key(i) || !opts.stabilize)
         .collect();
-    let skipped = paths.len() - order.len();
+    let unreadable = paths.len() - order.len();
     say!(
         "exporting {} frames to {} (window {} frames, stabilize={}, deflicker={}, {}×{}){}",
         order.len(),
@@ -931,7 +920,11 @@ pub fn export_sequence(
         opts.deflicker,
         ow,
         oh,
-        if skipped > 0 { format!("; {skipped} skipped (unaligned or sky saturated/above the white)") } else { String::new() }
+        if unreadable > 0 {
+            format!("; {unreadable} of the {} inputs could not be read at all and have no output", paths.len())
+        } else {
+            format!(" — one output per input frame, all {} of them", paths.len())
+        }
     );
     let t0 = Instant::now();
     crate::ui::task_begin("export", "export", order.len() as u64);

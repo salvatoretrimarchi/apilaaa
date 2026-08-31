@@ -643,17 +643,17 @@ stars in reference: 40
 pipeline: 12 workers, up to 90 frames in flight (total RAM 62.4 GiB, budget 80% = 50.0 GiB, 557 MiB/frame)
   [10/517] _DSC0010.ARW: 40 stars, 31 inliers, θ=-0.019°, t=(1.43,6.20), sky 0.2908, foreground 16.9% in 1.61s
   ...
-aligned: 459  interpolated: 10  skipped: 48  time: 66.9s
-stack selection: 153 of 469 aligned frames (median sky 0.2296, tolerance ×1.60); 293 with foreground (masked); ...
+aligned: 459  interpolated: 58  skipped: 0  time: 66.9s
+stack selection: 153 of 517 frames (median sky 0.2296, tolerance ×1.60); 293 with foreground (masked); ...
 glare/gradient [stack]: ...
 stacking 153 frames...
 stacked: 153  total time: 165.1s
 crop from drift: 6048×4024 → 5800×3848 (−176 px height, −248 px width)
 DNG written: stacked.dng
-exporting 451 frames to res_clean (window 7 frames, stabilize=true, deflicker=true, 5800×3848); 66 skipped (unaligned or sky saturated/above the white)
-  [436/451] _DSC0436_clean.dng  window 7 frames  transients 37246 px  defects ×1.10/1.16/1.31  anomaly 19.5%  gain R/G/B 0.831/0.815/0.824  sky +10.61%
-  [450/451] _DSC0450_clean.dng  window 5 frames  transients 0 px  defects ×1.00/1.00/1.00  anomaly 114.0%  gain R/G/B 0.930/0.932/0.676  sky +113.60%  dawn 93%
-exported 451 frames in 414.2s
+exporting 517 frames to res_clean (window 7 frames, stabilize=true, deflicker=true, 5800×3848) — one output per input frame, all 517 of them
+  [436/517] _DSC0436_clean.dng  window 7 frames  transients 37246 px  defects ×1.10/1.16/1.31  anomaly 19.5%  gain R/G/B 0.831/0.815/0.824  sky +10.61%
+  [450/517] _DSC0450_clean.dng  window 5 frames  transients 0 px  defects ×1.00/1.00/1.00  anomaly 114.0%  gain R/G/B 0.930/0.932/0.676  sky +113.60%  dawn 93%
+exported 517 frames in 414.2s
 ```
 
 An untracked run replaces the star fit with the drift it measured, reports what
@@ -682,8 +682,9 @@ What to look at:
   pixel or a satellite trail was matched as a star — the plausibility check
   catches it and reports `interpolated`.
 - **`stack selection`** tells you why frames were dropped, split by cause
-  (foreground, bright sky, dark sky) and how many were saturated enough not to
-  be worth exporting at all.
+  (foreground, bright sky, dark sky) and how many had a sky bright enough that
+  there is little left in it to clean — which is a remark, not an exclusion:
+  those frames are exported like every other.
 - **`defects ×`** on export is the per-channel gain applied to the defect model
   for that frame; it climbs towards dawn because stray light scales with the
   light entering the lens. **`anomaly`** is how much that frame differs from the
@@ -749,14 +750,14 @@ taken. That trade is the whole design.
 | Stage | Result |
 |---|---|
 | Alignment (pass 1) | 459 aligned, 10 recovered by interpolation, 48 skipped — 66.9 s |
-| Stack selection | 153 clear-sky frames kept of 469; 293 dropped for foreground, 13 for a bright sky, 10 saturated beyond exporting |
+| Stack selection | 153 clear-sky frames kept of 517; 293 dropped for foreground, 13 for a bright sky; 58 with a sky already saturated, exported all the same |
 | Stacking (pass 2) | 153 frames — 165.1 s total |
 | Crop from tracking drift | 6048×4024 → 5800×3848 (−248 × −176 px) |
-| Timelapse export | 451 frames — 414.2 s |
+| Timelapse export | 517 frames, one per input — 414.2 s |
 
-Two numbers are worth pulling out. **153 frames stack but 451 export**: rejection
-from the average is not rejection from the sequence, so most of the night that a
-stacker would throw away still becomes video. And a whole night of tracking
+Two numbers are worth pulling out. **153 frames stack and all 517 export**:
+rejection from the average is never rejection from the sequence, so the whole
+night a stacker would throw away still becomes video, with no hole in it. And a whole night of tracking
 drift costs only 8 % of the frame area, because the crop is computed as the
 largest rectangle every aligned frame actually covered rather than guessed at.
 
@@ -857,9 +858,15 @@ are simply masked out instead. Under `--fixed-tripod` the default becomes `1.0`:
 the landscape is in every frame and is part of the picture, so it is never a
 reason to drop one.
 
-Rejection from the stack is not rejection from the export: excluded frames are
-still written by `--export-clean`, the only exception being frames whose sky is
-already saturated, where there is nothing left to clean.
+Rejection from the stack is never rejection from the export. `--export-clean`
+writes **one output per input frame** — the frames dropped from the average for
+foreground or for a sky that is too bright, the ones whose alignment had to be
+interpolated or borrowed from the nearest frame that had one, the ones already
+saturated by dawn. An export is a sequence before it is a set of files: a hole
+in the middle of one is a jump the viewer sees and an off-by-one in whatever
+encodes it, so the bar for leaving a frame out is not that it came out poorly
+but that there is no image there at all. Only a file that could not be read from
+disk clears that bar, and the run names it.
 
 Under `--fixed-tripod` there is a second, stricter selection on top of this one,
 and it decides something else: which frames are allowed to determine the

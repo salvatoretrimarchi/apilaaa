@@ -85,8 +85,10 @@ pub struct Args {
     #[arg(long)]
     pub no_stack: bool,
 
-    /// Directory to export the clean timelapse sequence to: every aligned
-    /// frame (including the ones excluded from the stack) with the defect
+    /// Directory to export the clean timelapse sequence to: one output per
+    /// input frame — every frame that could be read, including the ones
+    /// excluded from the stack and the ones whose alignment had to be
+    /// borrowed from a neighbour — with the defect
     /// model + its own gradient and horizon glow subtracted, stabilized to
     /// the reference frame system (same alignment as the stack, same crop),
     /// with deflickering (per-channel median and high percentile matched to
@@ -352,7 +354,7 @@ fn run(args: Args) -> Result<()> {
             }
             drift_template = Some(tpl);
         }
-        infos.push(FrameInfo { idx: 0, m: Similarity::identity(), bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers: usize::MAX, export: true });
+        infos.push(FrameInfo { idx: 0, m: Similarity::identity(), bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, level_all: level, in_stack: true, in_model: true, aligned: true, inliers: usize::MAX });
     }
     drop(lum_ref);
     drop(ref_frame);
@@ -510,7 +512,7 @@ fn run(args: Args) -> Result<()> {
                             String::from(if args.fixed_no_stabilize { "identity" } else { "drift not measurable, identity" }),
                         ),
                     };
-                    infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers: n_stars, export: true });
+                    infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, level_all: level, in_stack: true, in_model: true, aligned: true, inliers: n_stars });
                     aligned += 1;
                     say!(
                         "  [{}/{}] {}: {} stars, {}, sky {:.4} in {:.2}s",
@@ -534,7 +536,7 @@ fn run(args: Args) -> Result<()> {
                     match (fit, bg) {
                         (Some((m, inliers)), Some((bg, mask, level))) if inliers >= MIN_INLIERS => {
                             let fg = mask.fraction();
-                            infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, in_stack: true, in_model: true, aligned: true, inliers, export: true });
+                            infos.push(FrameInfo { idx, m, bg, fit_mask: mask.clone(), mask, cloud: 0.0, level, level_all: level, in_stack: true, in_model: true, aligned: true, inliers });
                             aligned += 1;
                             say!(
                                 "  [{}/{}] {}: {} stars, {} inliers, θ={:.3}°, t=({:.2},{:.2}), sky {:.4}{} in {:.2}s",
@@ -563,7 +565,7 @@ fn run(args: Args) -> Result<()> {
                             );
                             pending.push(FrameInfo {
                                 idx, m: Similarity::identity(), bg, fit_mask: mask.clone(), mask, cloud: 0.0,
-                                level, in_stack: false, in_model: false, aligned: false, inliers: inl, export: true,
+                                level, level_all: level, in_stack: false, in_model: false, aligned: false, inliers: inl,
                             });
                         }
                         (_, None) => unreachable!(),
@@ -585,6 +587,7 @@ fn run(args: Args) -> Result<()> {
     // ---------------------------------------------------------------
     if !untracked {
         let mut n_fixed = 0usize;
+        let mut n_unaligned = 0usize;
         let mut bad: Vec<usize> = Vec::new();
         for k in 0..infos.len() {
             let Some(pred) = predict_transform(&infos, infos[k].idx, Some(k)) else { continue; };
@@ -618,17 +621,47 @@ fn run(args: Args) -> Result<()> {
                     n_fixed += 1;
                 }
                 None => {
-                    say!(
-                        "  {}: no aligned neighbours nearby, skipped",
-                        paths[f.idx].file_name().unwrap().to_string_lossy()
-                    );
-                    skipped += 1;
+                    // No aligned frame within the interpolation range. The
+                    // frame still decoded, so it still gets cleaned and
+                    // written: an export is a sequence, and a hole in it is
+                    // worse than a frame whose stars sit a little off. Take
+                    // the nearest alignment there is at any distance, and
+                    // identity if the session has none at all.
+                    let nearest = infos
+                        .iter()
+                        .filter(|o| o.aligned)
+                        .min_by_key(|o| o.idx.abs_diff(f.idx))
+                        .map(|o| o.m);
+                    match nearest {
+                        Some(m) => {
+                            say!(
+                                "  {}: no aligned neighbour within {} frames; exported with the nearest alignment there is, out of the stack",
+                                paths[f.idx].file_name().unwrap().to_string_lossy(), ALIGN_INTERP_RANGE
+                            );
+                            f.m = m;
+                        }
+                        None => {
+                            say!(
+                                "  {}: no aligned frame in the whole session; exported unstabilized, out of the stack",
+                                paths[f.idx].file_name().unwrap().to_string_lossy()
+                            );
+                            f.m = Similarity::identity();
+                        }
+                    }
+                    f.aligned = false;
+                    f.in_stack = false;
+                    f.in_model = false;
+                    n_unaligned += 1;
+                    infos.push(f);
                 }
             }
         }
         infos.sort_by_key(|f| f.idx);
         if n_fixed > 0 {
             say!("  {} frames with interpolated alignment", n_fixed);
+        }
+        if n_unaligned > 0 {
+            say!("  {} frames exported without an alignment of their own", n_unaligned);
         }
     }
 
@@ -683,6 +716,7 @@ fn run(args: Args) -> Result<()> {
                 cover.push(f.cloud);
                 f.fit_mask = flatten::union_mask(&f.mask, &c);
                 f.level = flatten::sky_level(&f.bg, &f.fit_mask);
+                f.level_all = flatten::sky_level(&f.bg, &f.mask);
             }
             cover.sort_by(|a, b| a.partial_cmp(b).unwrap());
             say!(
@@ -741,7 +775,10 @@ fn run(args: Args) -> Result<()> {
     // ---------------------------------------------------------------
     let med_level;
     {
-        let mut lv: Vec<f32> = infos.iter().map(|f| f.level).filter(|v| *v > 0.0).collect();
+        // The whole-frame level, on both sides of the comparison below: the
+        // rule is the one the tool has always had, and it has to keep
+        // meaning exactly what it meant.
+        let mut lv: Vec<f32> = infos.iter().map(|f| f.level_all).filter(|v| *v > 0.0).collect();
         med_level = if lv.is_empty() {
             0.0
         } else {
@@ -767,15 +804,14 @@ fn run(args: Args) -> Result<()> {
         let mut n_fg = 0usize;
         let mut n_bright = 0usize;
         let mut n_dark = 0usize;
-        let mut n_cloud = 0usize;
         let mut n_with_fg = 0usize;
         let mut n_sat = 0usize;
         for f in infos.iter_mut() {
             if f.mask.any() { n_with_fg += 1; }
-            // Everything is exported except an already saturated sky (full
-            // dawn): there is no image left to clean there.
+            // A sky this bright has little left in it to clean — but it is
+            // still a frame of the sequence, and the sequence is what is
+            // being exported. It is counted and reported, never dropped.
             if f.level >= EXPORT_MAX_LEVEL {
-                f.export = false;
                 n_sat += 1;
             }
             if !f.aligned {
@@ -783,22 +819,19 @@ fn run(args: Args) -> Result<()> {
             } else if f.mask.fraction() > max_fg {
                 f.in_stack = false;
                 n_fg += 1;
-            } else if f.cloud > CLOUD_MAX_FRAC {
-                f.in_stack = false;
-                n_cloud += 1;
-            } else if med_level > 0.0 && f.level > med_level * tol {
+            } else if med_level > 0.0 && f.level_all > med_level * tol {
                 f.in_stack = false;
                 n_bright += 1;
-            } else if med_level > 0.0 && f.level < med_level / tol {
+            } else if med_level > 0.0 && f.level_all < med_level / tol {
                 f.in_stack = false;
                 n_dark += 1;
             }
         }
         let n_stack = infos.iter().filter(|f| f.in_stack).count();
         say!(
-            "stack selection: {} of {} aligned frames (median sky {:.4}, tolerance ×{:.2}); {} with foreground (masked); excluded: {} for foreground > {:.0}%, {} for cloud > {:.0}%, {} for bright sky, {} for dark sky; {} with saturated sky (≥ {:.0}%) are not exported",
+            "stack selection: {} of {} frames (median sky {:.4}, tolerance ×{:.2}); {} with foreground (masked); excluded: {} for foreground > {:.0}%, {} for bright sky, {} for dark sky; {} with a sky already at or above {:.0}% (little left to clean, exported all the same)",
             n_stack, infos.len(), med_level, tol, n_with_fg, n_fg, 100.0 * max_fg,
-            n_cloud, 100.0 * CLOUD_MAX_FRAC, n_bright, n_dark, n_sat, 100.0 * EXPORT_MAX_LEVEL
+            n_bright, n_dark, n_sat, 100.0 * EXPORT_MAX_LEVEL
         );
         if n_stack == 0 {
             return Err(anyhow!("no frame passes the stack selection (tune --stack-sky-tolerance / --stack-max-foreground)"));
@@ -817,6 +850,14 @@ fn run(args: Args) -> Result<()> {
     // thing in the sky that looks like a defect from a single frame, and the
     // only way to be sure it never enters the model is to not let a doubtful
     // frame near it.
+    //
+    // This decides who *measures* the defects, and nothing else. A clouded
+    // frame is stacked like any other and exported like any other — cleaning
+    // it with the session's model is exactly what it needs, and it is the
+    // one thing the cloud must not be allowed to change. Whether a frame is
+    // too bright to average in is a separate question, asked by
+    // `--stack-sky-tolerance` above, which the user can tune; cloud cover
+    // never answers it.
     // ---------------------------------------------------------------
     {
         for f in infos.iter_mut() {
@@ -882,6 +923,7 @@ fn run(args: Args) -> Result<()> {
             let mask = f.fit_mask.clone();
             flat.apply_map(&mut f.bg, &mask);
             f.level = flatten::sky_level(&f.bg, &f.fit_mask);
+            f.level_all = flatten::sky_level(&f.bg, &f.mask);
         }
     }
 
@@ -1313,8 +1355,21 @@ pub struct FrameInfo {
     pub fit_mask: flatten::CellMask,
     /// Fraction of the frame this frame's cloud covers.
     pub cloud: f32,
-    /// Sky level (median G of the map without foreground).
+    /// Sky level (median G of the map without foreground **or cloud**): the
+    /// level of the sky this frame actually shows, which is what every
+    /// per-frame correction is scaled by and what the flat field is
+    /// regressed against.
     pub level: f32,
+    /// The same median with the cloud left in — the whole frame minus the
+    /// landscape.
+    ///
+    /// Two questions need two answers. "How bright is this frame's sky" is
+    /// about the sky, and a cloud is not it. "Is this frame too bright to
+    /// average into a stack" is about the frame as a whole, and a cloud very
+    /// much is: excluding it there would quietly disarm
+    /// `--stack-sky-tolerance`, which has always been what keeps a clouded
+    /// frame out of a deep stack, and would do so without saying so.
+    pub level_all: f32,
     /// Whether it enters the stack.
     pub in_stack: bool,
     /// Whether it helps determine the background: the flat field, the
@@ -1326,9 +1381,6 @@ pub struct FrameInfo {
     /// neighbours (exported only).
     pub aligned: bool,
     pub inliers: usize,
-    /// Whether it is exported by --export-clean (false: anomalously bright
-    /// sky — saturated dawn/twilight — where cleaning makes no sense).
-    pub export: bool,
 }
 
 /// Cloud cover above which a frame is counted as clouded in the report.
@@ -1354,14 +1406,9 @@ const MIN_HALF_FRAMES: usize = 8;
 /// dozen is what the flat field's per-cell regression needs to have a
 /// median at all (`FLAT_MIN_SAMPLES` in either half).
 const MODEL_MIN_FRAMES: usize = 24;
-/// Cloud cover above which a frame no longer takes part in the model or the
-/// stack. What is left of its sky is too little to measure a level on, and
-/// the level is what every per-frame correction is scaled by. It is still
-/// exported: cleaning it with the session's model is exactly what it needs.
-const CLOUD_MAX_FRAC: f32 = 0.5;
-
 /// Sky level (fraction of the sensor range, balanced scale) above which a
-/// frame is considered saturated and is not exported.
+/// frame's sky counts as saturated. Reported, never a reason to skip it:
+/// every frame that can be read is written.
 const EXPORT_MAX_LEVEL: f32 = 0.85;
 
 /// Minimum inliers to accept a star-based alignment.
