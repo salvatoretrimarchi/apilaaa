@@ -9,14 +9,27 @@
 //! 1. Every frame produces a low-resolution background map (`BgMap`):
 //!    clipped median over `BLOCK`×`BLOCK` px blocks, in balanced scale
 //!    (×wb). Stars take up a minuscule fraction of the block and do not move
-//!    the median. The **foreground mask** (`foreground_mask`) is derived
-//!    from that same map: trees, mountains, horizon — cells far below the
-//!    sky predicted by a smooth fit of the frame itself. Those cells enter
-//!    neither any fit nor the stack; in the timelapse sequence they are
-//!    shown as is.
+//!    the median. The same pass counts, per block, how many pixels sit well
+//!    above that background (`BgMap::star`) — the block's star signal, which
+//!    is what later tells sky from cloud. The **foreground mask**
+//!    (`foreground_mask`) is derived from the map: trees, mountains, horizon
+//!    — cells far below the sky predicted by a smooth fit of the frame
+//!    itself. Those cells enter neither any fit nor the stack; in the
+//!    timelapse sequence they are shown as is.
+//! 1b. On an untracked sequence, two more things are settled before any fit
+//!    is allowed to see the maps. The **cloud mask** (`cloud_masks`) marks,
+//!    per frame, the cells whose star signal has collapsed while their
+//!    background has risen: a cloud is opaque, and a defect is not. And the
+//!    camera's **multiplicative field** (`FlatField`) is measured from how
+//!    each cell answers a change in the sky level — then projected onto what
+//!    a lens can be (`lens_radial`), because on a fixed tripod the light
+//!    dome answers that question exactly like the vignetting does and would
+//!    otherwise be taken for it.
 //! 2. The maps of the frames selected for the stack are combined by
 //!    temporal median ignoring the foreground (`temporal_median_masked`;
-//!    rejects planes, satellites, passing clouds).
+//!    rejects planes, satellites, passing clouds). A frame with any cloud in
+//!    it is kept out of this median altogether: the mask says where the
+//!    cloud is, and where there is doubt the whole frame steps aside.
 //! 3. Over that map `poly3(x, y) + Σ f_p(r)·cos(h_p θ)` is fitted: a cubic
 //!    polynomial (light-pollution gradient, non-linear) plus free radial
 //!    profiles centred on the optical axis (which is searched for, not
@@ -38,6 +51,12 @@
 //!    are removed and extensive sky patches (dark nebulae) are preserved.
 //!    Only towards the edges (ramp r/r_full 0.5→0.9).
 //!    `--no-residual-surface` disables it.
+//!    On an untracked sequence that caution is replaced by evidence: the
+//!    surface is fitted on each chronological half of the session and only
+//!    what both halves put in the same sensor cells is kept
+//!    (`agreed_surface`). The sky turned between the two halves and the lens
+//!    did not, so what survives is background whatever its shape, and it is
+//!    subtracted whole, everywhere.
 //! 3c. Third stage: two 1D patterns of fixed geometry (not of the sky) are
 //!    extracted from the remaining residual: bands per sensor row (median
 //!    per row, high-pass in y) and flare spokes per angle around the optical
@@ -74,6 +93,21 @@ pub struct BgMap {
     /// Cells with real data (false = filled in by extrapolation because it
     /// was always occluded; it enters no fit). Empty = all of them.
     pub valid: Vec<bool>,
+    /// Star signal per cell (green, balanced scale): how much light the cell
+    /// holds *above* its own background, once the noise' own share of that
+    /// excess is taken off. Empty when the map was not measured from a frame.
+    ///
+    /// This is what tells cloud from sky. Both are smooth and both are
+    /// brighter than the background around them, so no threshold on the
+    /// background itself can separate them — but there are no stars behind a
+    /// cloud, and that survives every level the night goes through.
+    pub star: Vec<f32>,
+    /// Noise per cell (green, balanced scale): the MAD of the cell's pixels
+    /// about its own background. `star` is a small difference of large
+    /// numbers measured against this, so it is what says whether `star`
+    /// means anything — a session whose stars do not clear its noise cannot
+    /// be asked where its clouds are.
+    pub noise: Vec<f32>,
 }
 
 impl BgMap {
@@ -133,17 +167,30 @@ fn clipped_median(buf: &mut Vec<f32>, tmp: &mut Vec<f32>) -> f32 {
     median_inplace(tmp)
 }
 
-/// Background map of the frame: clipped median per block and channel, ×wb.
+/// How far above a block's own background, in MAD, a pixel has to sit to be
+/// counted as star. Far enough out that noise almost never reaches it,
+/// close enough that a faint star still does.
+const STAR_K_MAD: f32 = 4.0;
+/// The share of a starless block's pixels that clears `STAR_K_MAD` anyway,
+/// measured on the deepest sky of the test sessions. Subtracting it leaves a
+/// statistic that reads zero where there is nothing but noise, whatever the
+/// exposure.
+const STAR_NOISE_FRACTION: f32 = 0.0035;
+
+/// Background map of the frame: clipped median per block and channel, ×wb,
+/// plus the block's star signal in green (see `BgMap::star`).
 pub fn block_background(frame: &Frame) -> BgMap {
     let b = BLOCK;
     let gw = frame.width / b;
     let gh = frame.height / b;
     let w = frame.width;
     let wb = frame.wb;
-    let rows: Vec<Vec<f32>> = (0..gh)
+    let rows: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..gh)
         .into_par_iter()
         .map(|gy| {
             let mut out = vec![0.0f32; gw * 3];
+            let mut st = vec![0.0f32; gw];
+            let mut nz = vec![0.0f32; gw];
             let mut buf: Vec<f32> = Vec::with_capacity(b * b);
             let mut tmp: Vec<f32> = Vec::with_capacity(b * b);
             for gx in 0..gw {
@@ -155,17 +202,42 @@ pub fn block_background(frame: &Frame) -> BgMap {
                             buf.push(frame.rgb[(row + x) * 3 + c]);
                         }
                     }
-                    out[gx * 3 + c] = clipped_median(&mut buf, &mut tmp) * wb[c];
+                    let bgv = clipped_median(&mut buf, &mut tmp);
+                    out[gx * 3 + c] = bgv * wb[c];
+                    if c == 1 {
+                        // `buf` still holds this block's green pixels, and
+                        // `bgv` is the background they sit on with the bright
+                        // tail already clipped off — the right baseline to
+                        // measure that tail against.
+                        tmp.clear();
+                        tmp.extend(buf.iter().map(|v| (v - bgv).abs()));
+                        let mad = median_inplace(&mut tmp);
+                        let hi = bgv + STAR_K_MAD * mad;
+                        let over = buf.iter().filter(|&&v| v > hi).count() as f32
+                            / buf.len().max(1) as f32;
+                        // Signed, deliberately: a starless block has to be
+                        // able to come out negative. Clamping here and
+                        // averaging afterwards would rectify the noise into
+                        // a star signal that is not there, which is exactly
+                        // how a session with no measurable stars comes to
+                        // look like one that can be asked about clouds.
+                        st[gx] = over - STAR_NOISE_FRACTION;
+                        nz[gx] = mad * wb[c];
+                    }
                 }
             }
-            out
+            (out, st, nz)
         })
         .collect();
     let mut data = Vec::with_capacity(gw * gh * 3);
-    for r in rows {
+    let mut star = Vec::with_capacity(gw * gh);
+    let mut noise = Vec::with_capacity(gw * gh);
+    for (r, s, z) in rows {
         data.extend_from_slice(&r);
+        star.extend_from_slice(&s);
+        noise.extend_from_slice(&z);
     }
-    BgMap { gw, gh, block: b, data, valid: Vec::new() }
+    BgMap { gw, gh, block: b, data, valid: Vec::new(), star, noise }
 }
 
 /// Cell-by-cell temporal median of several maps (all the same size).
@@ -181,7 +253,7 @@ pub fn temporal_median(maps: &[BgMap]) -> BgMap {
             median_inplace(&mut v)
         })
         .collect();
-    BgMap { gw, gh, block: maps[0].block, data, valid: Vec::new() }
+    BgMap { gw, gh, block: maps[0].block, data, valid: Vec::new(), star: Vec::new(), noise: Vec::new() }
 }
 
 /// **Foreground** mask per cell of the background map (sensor
@@ -271,53 +343,8 @@ pub fn foreground_mask(map: &BgMap) -> CellMask {
             mask[i] = pred > 0.0 && v < FG_RATIO * pred;
         }
     }
-    // Drop small connected components.
-    {
-        let (gw, gh) = (map.gw, map.gh);
-        let mut visited = vec![false; n];
-        let mut stack: Vec<usize> = Vec::new();
-        let mut comp: Vec<usize> = Vec::new();
-        for start in 0..n {
-            if !mask[start] || visited[start] { continue; }
-            comp.clear();
-            stack.push(start);
-            visited[start] = true;
-            while let Some(i) = stack.pop() {
-                comp.push(i);
-                let x = i % gw;
-                let y = i / gw;
-                let nb = [
-                    if x > 0 { Some(i - 1) } else { None },
-                    if x + 1 < gw { Some(i + 1) } else { None },
-                    if y > 0 { Some(i - gw) } else { None },
-                    if y + 1 < gh { Some(i + gw) } else { None },
-                ];
-                for j in nb.into_iter().flatten() {
-                    if mask[j] && !visited[j] { visited[j] = true; stack.push(j); }
-                }
-            }
-            if comp.len() < FG_MIN_CELLS {
-                for &i in &comp { mask[i] = false; }
-            }
-        }
-    }
-    // Dilation.
-    if FG_DILATE > 0 && mask.iter().any(|&m| m) {
-        let (gw, gh) = (map.gw, map.gh);
-        let r = FG_DILATE;
-        let mut out = vec![false; n];
-        for gy in 0..gh {
-            for gx in 0..gw {
-                if !mask[gy * gw + gx] { continue; }
-                for yy in gy.saturating_sub(r)..=(gy + r).min(gh - 1) {
-                    for xx in gx.saturating_sub(r)..=(gx + r).min(gw - 1) {
-                        out[yy * gw + xx] = true;
-                    }
-                }
-            }
-        }
-        mask = out;
-    }
+    drop_small_components(&mut mask, map.gw, map.gh, FG_MIN_CELLS);
+    dilate(&mut mask, map.gw, map.gh, FG_DILATE);
     CellMask { gw: map.gw, gh: map.gh, block: map.block, data: mask }
 }
 
@@ -337,6 +364,304 @@ pub fn consensus_mask(masks: &[CellMask]) -> CellMask {
         .map(|i| masks.iter().filter(|m| m.data[i]).count() > half)
         .collect();
     CellMask { gw, gh, block: masks[0].block, data }
+}
+
+/// Fraction of the star signal typical at a cell's radius below which the
+/// sky there is taken to be covered by cloud.
+const CLOUD_STAR_RATIO: f32 = 0.35;
+/// How much brighter than its own clear-sky level a cell has to be before
+/// the missing stars are read as cloud. Both conditions are needed: a cloud
+/// takes the stars away *and* puts light in their place, and a cell that
+/// only does one of the two is telling us something else — an empty patch of
+/// sky, or a frame the estimator had a bad night with.
+const CLOUD_BG_EXCESS: f32 = 0.08;
+/// Percentile of a cell's own session of backgrounds taken as its clear-sky
+/// level. Low enough that a cell the cloud sits over for three quarters of
+/// the session still finds the sky underneath it.
+const CLOUD_CLEAR_PCT: f32 = 0.25;
+/// Fewest cells (4-connected) a cloud may occupy. A cloud is a weather
+/// system seen from below; anything smaller than this is the estimator's own
+/// noise, or a patch of sky that happens to hold no bright star.
+const CLOUD_MIN_CELLS: usize = 12;
+/// Dilation (cells) of the cloud mask: the edge of a cloud is a gradient,
+/// not a line, and the cells the threshold leaves out still hold half a
+/// cloud each.
+const CLOUD_DILATE: usize = 2;
+/// Radial bins of the star-signal reference.
+const STAR_REF_BINS: usize = 24;
+/// Radius, in cells, the star statistic is averaged over before it is
+/// thresholded.
+///
+/// One cell holds a thousand pixels, and the share of them a star pushes
+/// past `STAR_K_MAD` is a binomial with a standard deviation of the same
+/// order as the threshold itself — a test on a single cell would be reading
+/// its own noise as often as the sky. A cloud is never one cell wide
+/// (`CLOUD_MIN_CELLS`), so averaging over a neighbourhood costs nothing that
+/// matters and divides the uncertainty by the width of the window.
+const STAR_SMOOTH_CELLS: usize = 2;
+/// The star signal a session has to show, over the noise floor already taken
+/// off it, before it may be asked where its clouds are: as many 4-MAD pixels
+/// from stars as the noise produces on its own. Below that the statistic is
+/// a difference of two indistinguishable numbers, and a detector run on it
+/// flags whatever half of the frame the noise happened to dip in — which is
+/// worse than not looking, because those cells then leave the fits.
+const STAR_REF_MIN: f32 = 0.006;
+/// How many standard deviations below the sky's own level a cell's star
+/// count has to fall before the drop counts as measured rather than
+/// stumbled upon. The count is a binomial over the pixels the statistic was
+/// averaged across, so its spread is known exactly, and this is the second
+/// half of the test: `CLOUD_STAR_RATIO` says the drop is large, this says it
+/// is real.
+const CLOUD_Z: f32 = 4.0;
+
+/// Star signal the sky typically shows at each cell, as a function of
+/// nothing but the distance to the centre of the frame.
+///
+/// Two things make a cell hold fewer stars than another, and only one of
+/// them is weather. The lens passes less light towards the edges, so the
+/// same sky measures fainter there — which is radial, and shared by every
+/// frame of the session. A cloud is not radial: it sits over one part of the
+/// sky and leaves the rest of that same radius clear. So the reference is
+/// built by taking, at each radius, the median over all directions of the
+/// session's own median star signal, which the cloud cannot move as long as
+/// it leaves some of that ring alone.
+fn smooth_cells(v: &[f32], gw: usize, gh: usize, r: usize) -> Vec<f32> {
+    if r == 0 { return v.to_vec(); }
+    let mut out = vec![0.0f32; gw * gh];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let mut acc = 0.0f32;
+            let mut k = 0usize;
+            for yy in gy.saturating_sub(r)..=(gy + r).min(gh - 1) {
+                for xx in gx.saturating_sub(r)..=(gx + r).min(gw - 1) {
+                    let t = v[yy * gw + xx];
+                    if t.is_finite() { acc += t; k += 1; }
+                }
+            }
+            out[gy * gw + gx] = if k > 0 { acc / k as f32 } else { f32::NAN };
+        }
+    }
+    out
+}
+
+/// A frame's star statistic, averaged over `STAR_SMOOTH_CELLS`.
+fn smoothed_star(m: &BgMap) -> Vec<f32> {
+    smooth_cells(&m.star, m.gw, m.gh, STAR_SMOOTH_CELLS)
+}
+
+fn star_reference(maps: &[BgMap], land: &CellMask) -> Vec<f32> {
+    let (gw, gh) = (maps[0].gw, maps[0].gh);
+    let n = gw * gh;
+    let (cx, cy) = ((gw as f32 - 1.0) * 0.5, (gh as f32 - 1.0) * 0.5);
+    let r_max = (cx * cx + cy * cy).sqrt().max(1.0);
+    let radius: Vec<f32> = (0..n)
+        .map(|i| {
+            let (x, y) = ((i % gw) as f32 - cx, (i / gw) as f32 - cy);
+            (x * x + y * y).sqrt() / r_max
+        })
+        .collect();
+    // Per cell, the session's own median: a cloud that crosses the frame
+    // does not survive it, and one that stays does not survive the ring.
+    let smoothed: Vec<Vec<f32>> = maps.par_iter().map(smoothed_star).collect();
+    let per_cell: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            if land.data[i] { return f32::NAN; }
+            let mut v: Vec<f32> = maps
+                .iter()
+                .zip(&smoothed)
+                .filter(|(m, _)| !m.star.is_empty() && m.is_valid(i))
+                .map(|(_, sm)| sm[i])
+                .collect();
+            if v.is_empty() { f32::NAN } else { median_inplace(&mut v) }
+        })
+        .collect();
+    let nb = STAR_REF_BINS;
+    let mut bins: Vec<Vec<f32>> = vec![Vec::new(); nb];
+    for i in 0..n {
+        if per_cell[i].is_finite() {
+            bins[((radius[i] * nb as f32) as usize).min(nb - 1)].push(per_cell[i]);
+        }
+    }
+    let mut prof = vec![f32::NAN; nb];
+    for b in 0..nb {
+        if bins[b].len() >= FLAT_BIN_MIN_CELLS {
+            prof[b] = median_inplace(&mut bins[b]);
+        }
+    }
+    let mut last = f32::NAN;
+    for b in 0..nb {
+        if prof[b].is_finite() { last = prof[b]; } else { prof[b] = last; }
+    }
+    let mut back = f32::NAN;
+    for b in (0..nb).rev() {
+        if prof[b].is_finite() { back = prof[b]; } else { prof[b] = back; }
+    }
+    (0..n)
+        .map(|i| {
+            let r = radius[i] * nb as f32 - 0.5;
+            let j = r.floor().clamp(0.0, nb as f32 - 2.0) as usize;
+            let t = (r - j as f32).clamp(0.0, 1.0);
+            prof[j] * (1.0 - t) + prof[j + 1] * t
+        })
+        .collect()
+}
+
+/// Standard deviation of the star statistic where the sky shows `reference`,
+/// over `n_px` pixels: the count is a binomial, and `STAR_NOISE_FRACTION` is
+/// the share of it the noise contributes whether there are stars or not.
+fn star_sigma(reference: f32, n_px: f32) -> f32 {
+    let p = (reference + STAR_NOISE_FRACTION).clamp(1e-6, 1.0 - 1e-6);
+    (p * (1.0 - p) / n_px.max(1.0)).sqrt()
+}
+
+/// Per-frame **cloud** mask: the cells whose sky is covered.
+///
+/// A cloud lit from below by a town is the one thing in a light-polluted
+/// frame that looks exactly like what this whole pipeline is built to
+/// remove. It is smooth, it is far brighter than the sky around it, and it
+/// sits in one part of the frame — which is also a fair description of a
+/// lens halo, of a flare wedge and of the light dome itself. Told apart by
+/// brightness or by shape, it is not told apart at all: on the Canon test
+/// session a cloud covering a third of the frame went straight into the
+/// defect model, and the model then subtracted it from every frame of the
+/// night, including the ones where that patch of sky was clear.
+///
+/// What separates them is what is behind. A defect is stray light *added*
+/// on top of the sky, and the stars come through it: the halo of a lens
+/// dims nothing. A cloud is opaque, and behind it there are no stars. So the
+/// test is on the stars, not on the light: a cell whose star signal has
+/// fallen below `CLOUD_STAR_RATIO` of what the sky shows at that radius is
+/// covered, however bright it is.
+///
+/// The mask is per frame, because that is what a cloud is: the same cell is
+/// sky again ten frames later. Cells it covers take part in no fit — not the
+/// flat field, not the session median, not the frame's own anomaly — and the
+/// export shows them as the frame took them.
+pub fn cloud_masks(maps: &[BgMap], land: &CellMask) -> Vec<CellMask> {
+    let (gw, gh, block) = (maps[0].gw, maps[0].gh, maps[0].block);
+    let n = gw * gh;
+    if maps.iter().any(|m| m.star.is_empty()) {
+        return maps
+            .iter()
+            .map(|_| CellMask { gw, gh, block, data: vec![false; n] })
+            .collect();
+    }
+    let reference = star_reference(maps, land);
+    // Can this session be asked the question at all?
+    {
+        let mut r: Vec<f32> = (0..n)
+            .filter(|&i| !land.data[i] && reference[i].is_finite())
+            .map(|i| reference[i])
+            .collect();
+        let med = if r.is_empty() { 0.0 } else { median_inplace(&mut r) };
+        if med < STAR_REF_MIN {
+            say!(
+                "cloud: not measurable — the stars of this session clear the noise by {:.4} against the {:.4} the test needs, so no cell is excluded as cloud",
+                med, STAR_REF_MIN
+            );
+            return maps
+                .iter()
+                .map(|_| CellMask { gw, gh, block, data: vec![false; n] })
+                .collect();
+        }
+    }
+    // Each cell's own clear-sky background: a low percentile over the
+    // session, which the cloud cannot lift because a cloud only ever adds.
+    let clear: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut v: Vec<f32> = maps
+                .iter()
+                .filter(|m| m.is_valid(i))
+                .map(|m| m.data[i * 3 + 1])
+                .collect();
+            if v.is_empty() { return f32::NAN; }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) as f32 * CLOUD_CLEAR_PCT) as usize]
+        })
+        .collect();
+    // Pixels behind one smoothed cell: what the binomial spread of the star
+    // count is measured over.
+    let k_cells = (2 * STAR_SMOOTH_CELLS + 1) * (2 * STAR_SMOOTH_CELLS + 1);
+    let n_px = (k_cells * block * block) as f32;
+    maps.par_iter()
+        .map(|m| {
+            let star = smoothed_star(m);
+            let mut mask: Vec<bool> = (0..n)
+                .map(|i| {
+                    !land.data[i]
+                        && m.is_valid(i)
+                        && reference[i].is_finite()
+                        && reference[i] > 0.0
+                        && star[i] < CLOUD_STAR_RATIO * reference[i]
+                        && star[i] < reference[i] - CLOUD_Z * star_sigma(reference[i], n_px)
+                        && clear[i].is_finite()
+                        && m.data[i * 3 + 1] > clear[i] * (1.0 + CLOUD_BG_EXCESS)
+                })
+                .collect();
+            drop_small_components(&mut mask, gw, gh, CLOUD_MIN_CELLS);
+            dilate(&mut mask, gw, gh, CLOUD_DILATE);
+            CellMask { gw, gh, block, data: mask }
+        })
+        .collect()
+}
+
+/// Union of two cell masks (same grid).
+pub fn union_mask(a: &CellMask, b: &CellMask) -> CellMask {
+    CellMask {
+        gw: a.gw,
+        gh: a.gh,
+        block: a.block,
+        data: (0..a.data.len()).map(|i| a.data[i] || b.data[i]).collect(),
+    }
+}
+
+/// Clears every 4-connected component of `mask` smaller than `min_cells`.
+fn drop_small_components(mask: &mut [bool], gw: usize, gh: usize, min_cells: usize) {
+    let n = gw * gh;
+    let mut visited = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut comp: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if !mask[start] || visited[start] { continue; }
+        comp.clear();
+        stack.push(start);
+        visited[start] = true;
+        while let Some(i) = stack.pop() {
+            comp.push(i);
+            let (x, y) = (i % gw, i / gw);
+            let nb = [
+                if x > 0 { Some(i - 1) } else { None },
+                if x + 1 < gw { Some(i + 1) } else { None },
+                if y > 0 { Some(i - gw) } else { None },
+                if y + 1 < gh { Some(i + gw) } else { None },
+            ];
+            for j in nb.into_iter().flatten() {
+                if mask[j] && !visited[j] { visited[j] = true; stack.push(j); }
+            }
+        }
+        if comp.len() < min_cells {
+            for &i in &comp { mask[i] = false; }
+        }
+    }
+}
+
+/// Grows `mask` by `r` cells in every direction.
+fn dilate(mask: &mut Vec<bool>, gw: usize, gh: usize, r: usize) {
+    if r == 0 || !mask.iter().any(|&m| m) { return; }
+    let mut out = vec![false; gw * gh];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            if !mask[gy * gw + gx] { continue; }
+            for yy in gy.saturating_sub(r)..=(gy + r).min(gh - 1) {
+                for xx in gx.saturating_sub(r)..=(gx + r).min(gw - 1) {
+                    out[yy * gw + xx] = true;
+                }
+            }
+        }
+    }
+    *mask = out;
 }
 
 /// Sky level of the frame: median of G over the map cells that are not
@@ -379,6 +704,11 @@ const FLAT_SMOOTH_CELLS: usize = 6;
 /// `FlatField::colour_radial`). Few enough that no patch can survive them,
 /// enough to follow a falloff that parts with wavelength towards the edges.
 const FLAT_COLOUR_BINS: usize = 12;
+/// Radial bins the multiplicative field is collapsed onto (see
+/// `lens_radial`), and the fewest cells a bin needs before its own median
+/// is trusted rather than inherited from the bin inside it.
+const FLAT_RADIAL_BINS: usize = 48;
+const FLAT_BIN_MIN_CELLS: usize = 8;
 /// How far apart the two half-session fits may land before the field is
 /// judged not to have been measured, as a fraction of the field's own
 /// peak-to-trough. Relative rather than absolute: the question is whether the
@@ -411,11 +741,30 @@ const FLAT_MAX_DISAGREEMENT: f32 = 0.20;
 /// optical axis sits or what shape the falloff has, which is what the
 /// parametric fit could not settle on its own.
 ///
-/// Sky structure does not leak into the slope. On an untracked sequence the
-/// sky rotates through each cell, so its contribution is uncorrelated with
-/// `S(t)` and the robust regression averages it out; on a tracked one it is
-/// steady in time while the light pollution varies, so it lands in the
-/// intercept. Either way it stays out of `V`.
+/// Star structure does not leak into the slope: the sky rotates through each
+/// cell, so its contribution is uncorrelated with `S(t)` and the robust
+/// regression averages it out.
+///
+/// The **light-pollution dome** does leak, and it is the one thing the
+/// regression cannot tell the lens from. On a fixed tripod the dome is
+/// stationary in sensor coordinates exactly like the vignetting is, and it
+/// grows and fades with the very level `S(t)` the slope is measured
+/// against, so `map_i(t) = V_i·S(t)` fits the dome as faithfully as it fits
+/// the lens. Left alone, the field comes out as the dome: measured on the
+/// Canon test session it claimed a transmission running from 1.5 % to 670 %
+/// of the centre, and `apply_map` then drove background maps of median 0.21
+/// down to −1.0, after which every fit downstream was working on a frame
+/// that no camera ever took (halo 1871 %, residual MAD 12.7 %, against
+/// 63 % and 0.45 % for the same frames with no field at all).
+///
+/// What separates the two is shape, not time. A dome is a gradient across
+/// the frame — brightest towards one edge, and steadily darker away from
+/// it; vignetting is a bowl about the optical axis, the same in every
+/// direction, and it never transmits more towards the edge than towards the
+/// centre. So the measured slope field is projected onto what a lens can be
+/// before it is used at all (`lens_radial`): the tilt goes back to the
+/// additive model, where the dome belongs, and only the radial, outward
+/// non-increasing part is kept as `V`.
 #[derive(Clone)]
 pub struct FlatField {
     pub gw: usize,
@@ -423,9 +772,25 @@ pub struct FlatField {
     pub block: usize,
     /// Slope per cell and channel, normalised to a median of 1.
     pub data: Vec<f32>,
+    /// Session sky level per channel: the median, over the frames the field
+    /// was fitted on, of each frame's own median over its sky cells —
+    /// measured before anything is added back.
+    ///
+    /// The deficit the field implies is a quantity of light, so it only
+    /// means anything against a level, and every place that adds it back
+    /// has to use the *same* one or the two do not cancel. They did not:
+    /// `apply_map` measured it on the map in front of it while `clean_frame`
+    /// took `model.pedestal`, which is the median of a map that had already
+    /// been lifted, 1.6× larger on the Canon session. The frames came out
+    /// with 60% of the deficit added twice — a bright rim and a dark hole in
+    /// the middle, on top of a background the model itself fitted to 0.06%.
+    pub level: [f32; 3],
     /// Brightest over darkest sky level among the frames used: the lever the
     /// regression had to work with.
     pub lever: f32,
+    /// Peak-to-trough of the projected field: how much falloff the session
+    /// measured at all.
+    pub spread: f32,
     /// Median distance, per cell, between the fits of two interleaved halves
     /// of the session. This is what decides whether the field is used.
     pub disagreement: f32,
@@ -440,6 +805,8 @@ impl FlatField {
         FlatField {
             gw, gh, block,
             data: vec![1.0; gw * gh * 3],
+            level: [0.0; 3],
+            spread: 0.0,
             lever,
             disagreement: f32::INFINITY,
             usable: false,
@@ -600,34 +967,59 @@ impl FlatField {
         out
     }
 
-    /// Adds back the deficit the field implies at this map's own sky level,
-    /// in place, so everything fitted downstream sees the same frame that
-    /// `clean_frame` will produce. The two must agree: the model is fitted on
-    /// these maps and then subtracted from those pixels.
-    pub fn apply_map(&self, map: &mut BgMap) {
+    /// The deficit this field implies for a frame whose sky sits at `ratio`
+    /// times the session level, per channel and cell.
+    ///
+    /// One definition, used by every caller: `apply_map` here and
+    /// `clean_frame` on the pixels. What the model is fitted on and what it
+    /// is subtracted from have to be the same frame.
+    #[inline]
+    pub fn deficit(&self, t: [f32; 3], ratio: f32) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            out[c] = (1.0 - t[c].clamp(FLAT_MIN_TRANSMISSION, 1.0)) * self.level[c] * ratio;
+        }
+        out
+    }
+
+    /// This map's sky level relative to the session's (green): what the
+    /// deficit is scaled by, so a brighter frame gets back proportionally
+    /// more light and a fainter one less.
+    pub fn ratio(&self, map: &BgMap, mask: &CellMask) -> f32 {
+        if !(self.level[1] > 0.0) { return 1.0; }
+        let l = sky_level(map, mask);
+        if l > 0.0 { l / self.level[1] } else { 1.0 }
+    }
+
+    /// Adds back the deficit the field implies, in place, so everything
+    /// fitted downstream sees the same frame that `clean_frame` will
+    /// produce. The two must agree: the model is fitted on these maps and
+    /// then subtracted from those pixels.
+    pub fn apply_map(&self, map: &mut BgMap, mask: &CellMask) {
         if !self.usable { return; }
         let n = map.gw * map.gh;
-        let mut level = [0.0f32; 3];
-        for c in 0..3 {
-            let mut v: Vec<f32> = (0..n)
-                .filter(|&i| map.is_valid(i))
-                .map(|i| map.data[i * 3 + c])
-                .collect();
-            if !v.is_empty() { level[c] = median_inplace(&mut v); }
-        }
+        let ratio = self.ratio(map, mask);
         for i in 0..n {
-            for c in 0..3 {
-                let t = self.data[i * 3 + c].clamp(FLAT_MIN_TRANSMISSION, 1.0 / FLAT_MIN_TRANSMISSION);
-                map.data[i * 3 + c] += (1.0 - t) * level[c];
-            }
+            let t = [self.data[i * 3], self.data[i * 3 + 1], self.data[i * 3 + 2]];
+            let d = self.deficit(t, ratio);
+            for c in 0..3 { map.data[i * 3 + c] += d[c]; }
         }
     }
 
     /// Peak-to-trough of the green slope, as a percentage.
     pub fn report(&self) -> String {
         if !self.usable {
+            // Two different failures, and they mean different things: a
+            // session that never gave the regression a lever, and one that
+            // gave it a lever and got two different answers with it.
+            if !(self.spread > 1e-6) {
+                return format!(
+                    "no falloff measurable over this session (sky level spread ×{:.2}) — nothing added back",
+                    self.lever
+                );
+            }
             return format!(
-                "not measurable (sky level spread ×{:.2}, half-session fits differ by {:.0}% of the field, limit {:.0}%) — nothing divided out",
+                "not measurable (sky level spread ×{:.2}, half-session fits differ by {:.0}% of the field, limit {:.0}%) — nothing added back",
                 self.lever, 100.0 * self.disagreement, 100.0 * FLAT_MAX_DISAGREEMENT
             );
         }
@@ -665,9 +1057,17 @@ pub fn fit_flat_field(maps: &[BgMap], masks: &[CellMask], levels: &[f32]) -> Fla
         return FlatField::flat(gw, gh, block, lever);
     }
 
-    let full = fit_slopes(maps, masks, levels, 1, 0);
-    let half_a = fit_slopes(maps, masks, levels, 2, 0);
-    let half_b = fit_slopes(maps, masks, levels, 2, 1);
+    // Every field is projected onto a lens profile before anything is asked
+    // of it, the halves included: what the reproducibility test has to
+    // measure is whether the field that will actually be divided out comes
+    // back the same from either half of the session, not whether the raw
+    // slopes do.
+    let mut full = fit_slopes(maps, masks, levels, 1, 0);
+    let mut half_a = fit_slopes(maps, masks, levels, 2, 0);
+    let mut half_b = fit_slopes(maps, masks, levels, 2, 1);
+    for f in [&mut full, &mut half_a, &mut half_b] {
+        lens_radial(f, gw, gh);
+    }
     let n = gw * gh;
     let mut d: Vec<f32> = Vec::with_capacity(n);
     for i in 0..n {
@@ -688,10 +1088,147 @@ pub fn fit_flat_field(maps: &[BgMap], masks: &[CellMask], levels: &[f32]) -> Fla
         median_inplace(&mut d) / spread
     };
 
-    let mut field = FlatField { gw, gh, block, data: full, lever, disagreement, usable: false };
+    // The level the deficit will be measured against, from the same frames
+    // and the same sky cells the field was fitted on.
+    let mut level = [0.0f32; 3];
+    for c in 0..3 {
+        let mut per_frame: Vec<f32> = maps
+            .iter()
+            .zip(masks)
+            .filter_map(|(m, mk)| {
+                let mut v: Vec<f32> = (0..gw * gh)
+                    .filter(|&i| m.is_valid(i) && !mk.data[i])
+                    .map(|i| m.data[i * 3 + c])
+                    .collect();
+                if v.is_empty() { None } else { Some(median_inplace(&mut v)) }
+            })
+            .collect();
+        if !per_frame.is_empty() { level[c] = median_inplace(&mut per_frame); }
+    }
+
+    let mut field = FlatField { gw, gh, block, data: full, level, spread, lever, disagreement, usable: false };
     field.usable = disagreement <= FLAT_MAX_DISAGREEMENT;
     if field.usable { field.smooth(); }
     field
+}
+
+/// Projects a measured slope field onto what a lens can actually be: a
+/// profile that depends only on the distance to the optical axis and never
+/// rises outward.
+///
+/// This is what makes the field identifiable on a fixed tripod at all. The
+/// regression behind it (`fit_slopes`) answers "how much does this cell
+/// brighten when the sky brightens", and two different things answer it the
+/// same way: the lens, which passes a fixed fraction of whatever arrives,
+/// and the light-pollution dome, which is stationary on the sensor because
+/// the camera is and grows with the sky because it *is* the sky. Only their
+/// shapes differ, so the shape is what the projection keeps:
+///
+/// 1. A robust plane is fitted to the field. A dome is a gradient — brighter
+///    towards the horizon and steadily darker away from it — so this is
+///    where nearly all of it goes. A bowl about the axis has no tilt for the
+///    plane to take.
+/// 2. Only the plane's **tilt** is removed, never its constant: the question
+///    is which way the field leans, not how much light it passes overall.
+/// 3. What is left is collapsed onto a radial profile by azimuthal median
+///    about the frame centre — the optical axis of a rectilinear lens sits
+///    within a few per cent of it, far closer than the cell grid resolves.
+/// 4. The profile is forced to be non-increasing outwards. A lens cannot
+///    transmit more at the edge than on the axis; anything that rises is
+///    dome the plane did not reach, and it is not the lens'.
+/// 5. Normalised to 1 on the axis and floored at `FLAT_MIN_TRANSMISSION`.
+///    Every cell then implies a deficit to add back rather than a surplus to
+///    subtract, which is the only sign a transmission can have.
+///
+/// Cells that carry no measurement (NaN) enter neither the plane nor the
+/// bins; they still come out of the profile, because a lens has a
+/// transmission there whether this session measured it or not.
+fn lens_radial(data: &mut [f32], gw: usize, gh: usize) {
+    let n = gw * gh;
+    let (cx, cy) = ((gw as f32 - 1.0) * 0.5, (gh as f32 - 1.0) * 0.5);
+    let r_max = (cx * cx + cy * cy).sqrt().max(1.0);
+    // Normalised offset from the centre and radius, per cell.
+    let uv: Vec<[f32; 3]> = (0..n)
+        .map(|i| {
+            let (x, y) = ((i % gw) as f32 - cx, (i / gw) as f32 - cy);
+            [x / r_max, y / r_max, (x * x + y * y).sqrt() / r_max]
+        })
+        .collect();
+    for c in 0..3 {
+        let v: Vec<f32> = (0..n).map(|i| data[i * 3 + c]).collect();
+        if v.iter().filter(|x| x.is_finite()).count() < n / 4 {
+            for i in 0..n { data[i * 3 + c] = 1.0; }
+            continue;
+        }
+        // 1-2. Robust plane, of which only the tilt is used.
+        let mut wgt: Vec<f32> = v.iter().map(|x| if x.is_finite() { 1.0 } else { 0.0 }).collect();
+        let mut coef = [0.0f64; 3];
+        for pass in 0..FLAT_IRLS_PASSES {
+            let mut a = [0.0f64; 9];
+            let mut b = [0.0f64; 3];
+            for i in 0..n {
+                let w = wgt[i] as f64;
+                if w <= 0.0 { continue; }
+                let t = [1.0f64, uv[i][0] as f64, uv[i][1] as f64];
+                for r in 0..3 {
+                    for k in 0..3 { a[r * 3 + k] += w * t[r] * t[k]; }
+                    b[r] += w * t[r] * v[i] as f64;
+                }
+            }
+            let (mut am, mut bm) = (a, b);
+            match solve_dense(&mut am, &mut bm, 3) {
+                Some(sol) => coef = [sol[0], sol[1], sol[2]],
+                None => break,
+            }
+            if pass + 1 == FLAT_IRLS_PASSES { break; }
+            let resid = |i: usize| {
+                (v[i] as f64 - (coef[0] + coef[1] * uv[i][0] as f64 + coef[2] * uv[i][1] as f64)).abs() as f32
+            };
+            let mut res: Vec<f32> = (0..n).filter(|&i| v[i].is_finite()).map(resid).collect();
+            let mad = median_inplace(&mut res).max(1e-9);
+            for i in 0..n {
+                wgt[i] = if v[i].is_finite() && resid(i) <= FLAT_IRLS_K * mad { 1.0 } else { 0.0 };
+            }
+        }
+        // 3. Azimuthal median per radial bin, over the de-tilted field.
+        let nb = FLAT_RADIAL_BINS;
+        let mut bins: Vec<Vec<f32>> = vec![Vec::new(); nb];
+        for i in 0..n {
+            if !v[i].is_finite() { continue; }
+            let d = v[i] - (coef[1] * uv[i][0] as f64 + coef[2] * uv[i][1] as f64) as f32;
+            bins[((uv[i][2] * nb as f32) as usize).min(nb - 1)].push(d);
+        }
+        let mut prof = vec![f32::NAN; nb];
+        for b in 0..nb {
+            if bins[b].len() >= FLAT_BIN_MIN_CELLS {
+                prof[b] = median_inplace(&mut bins[b]);
+            }
+        }
+        // Bins too thin to have their own median (the corners) inherit the
+        // one inside them.
+        let mut last = f32::NAN;
+        for b in 0..nb {
+            if prof[b].is_finite() { last = prof[b]; } else { prof[b] = last; }
+        }
+        // 4-5. Non-increasing outwards, normalised on the axis.
+        if !(prof[0].is_finite() && prof[0] > 1e-6) {
+            for i in 0..n { data[i * 3 + c] = 1.0; }
+            continue;
+        }
+        for b in 1..nb {
+            prof[b] = prof[b].min(prof[b - 1]);
+        }
+        let axis = prof[0];
+        for p in prof.iter_mut() {
+            *p = (*p / axis).clamp(FLAT_MIN_TRANSMISSION, 1.0);
+        }
+        for i in 0..n {
+            let r = uv[i][2] * nb as f32 - 0.5;
+            let j = r.floor().clamp(0.0, nb as f32 - 2.0) as usize;
+            let t = (r - j as f32).clamp(0.0, 1.0);
+            data[i * 3 + c] = prof[j] * (1.0 - t) + prof[j + 1] * t;
+        }
+    }
 }
 
 /// Per-cell slopes over every `step`-th frame starting at `offset`,
@@ -758,7 +1295,11 @@ fn fit_slopes(
 
     // Normalise each channel to a median of 1: only the shape of the field
     // matters, its overall level belongs to the exposure.
-    let mut data = vec![1.0f32; n * 3];
+    // Cells the regression could not settle come back as NaN, not as 1:
+    // an unmeasured cell must take part in no median, no plane and no
+    // radial bin, and a 1 there is indistinguishable from a cell that
+    // really did transmit like the centre.
+    let mut data = vec![f32::NAN; n * 3];
     for c in 0..3 {
         let mut v: Vec<f32> = slopes.iter().filter_map(|s| {
             if s[c].is_finite() { Some(s[c]) } else { None }
@@ -767,7 +1308,7 @@ fn fit_slopes(
         let med = median_inplace(&mut v).max(1e-9);
         for i in 0..n {
             let s = slopes[i][c];
-            data[i * 3 + c] = if s.is_finite() { (s / med).clamp(0.05, 20.0) } else { 1.0 };
+            data[i * 3 + c] = if s.is_finite() { (s / med).clamp(0.05, 20.0) } else { f32::NAN };
         }
     }
     data
@@ -847,7 +1388,7 @@ pub fn temporal_median_masked(maps: &[BgMap], masks: &[CellMask]) -> (BgMap, usi
         }
     }
     let valid = if filled > 0 { real_valid } else { Vec::new() };
-    (BgMap { gw, gh, block: maps[0].block, data, valid }, filled)
+    (BgMap { gw, gh, block: maps[0].block, data, valid, star: Vec::new(), noise: Vec::new() }, filled)
 }
 
 /// Number of terms of the background polynomial (full degree 3:
@@ -881,6 +1422,13 @@ pub struct GlareModel {
     /// "Lower envelope" residual surface (see `fit_residual_surface`);
     /// None if disabled.
     pub surface: Option<Surface>,
+    /// The residual surface has been shown to be fixed to the sensor, so it
+    /// is subtracted whole rather than only where symmetry vouches for it
+    /// (see `verify_surface`). Untracked sequences only.
+    pub surface_verified: bool,
+    /// Fraction of the surface's amplitude the two halves of the session
+    /// agreed on. Diagnostic.
+    pub surface_agreement: f32,
     /// Coarse surface (same lower envelope at a ~600 px scale). It is
     /// subtracted from the fine one so that only **fine** structure (lines,
     /// wedges, bands) is removed and not extensive sky patches (dark
@@ -1308,6 +1856,70 @@ fn smooth_surface(sf: &Surface, sigma_px: f32) -> Surface {
     Surface { nx, ny, step: sf.step, data, range: sf.range }
 }
 const SURF_CG_ITERS: usize = 400;
+/// How far the sky must have turned between the two halves of an untracked
+/// session, at half the frame's radius, before the halves are allowed to
+/// vouch for the residual surface: twice the scale of the surface's own
+/// coarse component. Below that the sky has not left the structure it was
+/// sitting on, and two halves agreeing means only that neither had time to
+/// disagree.
+const SURF_VERIFY_MIN_PX: f32 = 2.0 * SURF_COARSE_SIGMA_PX;
+
+/// The part of two half-session surfaces that both agree on, node by node.
+///
+/// This is the whole argument for subtracting a large, lopsided structure
+/// from an untracked frame. On a tracked sequence there is no way to tell a
+/// flare wedge from a dark nebula except by shape, which is why the wedge is
+/// only removed where its mirror image vouches for it — and why half the
+/// light dome survives the correction. On a fixed tripod the sky itself
+/// answers the question: it turns, and the lens does not. Structure that
+/// sits on the same sensor cells in the first half of the night and in the
+/// second is not in the sky, whatever shape it has; structure that moved is,
+/// however symmetric it looks.
+///
+/// So each half of the session is reduced to its own median map, a surface
+/// is fitted to each, and what is kept is what both found: same sign, and
+/// the smaller of the two magnitudes. A dome that stayed put comes through
+/// whole. The Milky Way, having moved on, appears in one surface and not the
+/// other, and comes through as nothing.
+fn agreed_surface(a: &Surface, b: &Surface) -> (Surface, f32) {
+    let n = a.nx * a.ny;
+    // Each half is levelled on its own median first: the sky was not the
+    // same brightness in both, and a constant difference between them is
+    // not structure either of them measured.
+    let level = |s: &Surface| -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            let mut v: Vec<f32> = (0..n).map(|i| s.data[i * 3 + c]).collect();
+            out[c] = median_inplace(&mut v);
+        }
+        out
+    };
+    let (la, lb) = (level(a), level(b));
+    let mut data = vec![0.0f32; n * 3];
+    let mut kept = 0.0f64;
+    let mut total = 0.0f64;
+    for i in 0..n {
+        for c in 0..3 {
+            let (x, y) = (a.data[i * 3 + c] - la[c], b.data[i * 3 + c] - lb[c]);
+            let v = if x * y > 0.0 { x.signum() * x.abs().min(y.abs()) } else { 0.0 };
+            data[i * 3 + c] = v;
+            kept += v.abs() as f64;
+            total += (0.5 * (x.abs() + y.abs())) as f64;
+        }
+    }
+    let mut range = [0.0f32; 3];
+    for c in 0..3 {
+        let (mut mn, mut mx) = (f32::MAX, f32::MIN);
+        for i in 0..n {
+            mn = mn.min(data[i * 3 + c]);
+            mx = mx.max(data[i * 3 + c]);
+        }
+        range[c] = mx - mn;
+    }
+    let agreement = if total > 0.0 { (kept / total) as f32 } else { 0.0 };
+    (Surface { nx: a.nx, ny: a.ny, step: a.step, data, range }, agreement)
+}
+
 /// Radial ramp over which the surface is applied, in units of `r_full`.
 const SURF_R_START: f32 = 0.5;
 const SURF_R_END: f32 = 0.9;
@@ -1765,7 +2377,21 @@ impl GlareModel {
     /// Fits the model to the map: searches for the optical centre (minimum
     /// robust residual in G, coarse→fine search within the central ±25%)
     /// and fits polynomial + profile per channel.
-    pub fn fit(map: &BgMap, width: usize, height: usize, with_surface: bool) -> Self {
+    ///
+    /// `halves` is the evidence an untracked session can give about its own
+    /// residual surface: the median maps of its two chronological halves and
+    /// how far the sky turned between them, in pixels at half the frame's
+    /// radius. Given enough motion, the surface is verified against the
+    /// halves (`agreed_surface`) and then subtracted whole instead of only
+    /// where its mirror image vouches for it. `None` on a tracked sequence,
+    /// where the sky does not move and there is nothing to check against.
+    pub fn fit(
+        map: &BgMap,
+        width: usize,
+        height: usize,
+        with_surface: bool,
+        halves: Option<(&BgMap, &BgMap, f32)>,
+    ) -> Self {
         let r_step = (map.block * 2) as f32;
         let w = width as f32;
         let h = height as f32;
@@ -1819,6 +2445,8 @@ impl GlareModel {
             residual_mad: [0.0; 3],
             flat: None,
             surface: None,
+            surface_verified: false,
+            surface_agreement: 0.0,
             surface_coarse: None,
             lines: None,
             horizon: None,
@@ -1831,7 +2459,23 @@ impl GlareModel {
             model.residual_mad[c] = f.resid_mad;
         }
         if with_surface {
-            model.surface = Some(fit_residual_surface(map, &model, SURF_STEP_CELLS, SURF_LAMBDA));
+            let full = fit_residual_surface(map, &model, SURF_STEP_CELLS, SURF_LAMBDA);
+            let verified = match halves {
+                Some((a, b, motion_px)) if motion_px >= SURF_VERIFY_MIN_PX => {
+                    let sa = fit_residual_surface(a, &model, SURF_STEP_CELLS, SURF_LAMBDA);
+                    let sb = fit_residual_surface(b, &model, SURF_STEP_CELLS, SURF_LAMBDA);
+                    Some(agreed_surface(&sa, &sb))
+                }
+                _ => None,
+            };
+            match verified {
+                Some((sf, agreement)) => {
+                    model.surface_verified = true;
+                    model.surface_agreement = agreement;
+                    model.surface = Some(sf);
+                }
+                None => model.surface = Some(full),
+            }
             model.surface_coarse = model.surface.as_ref().map(|s| smooth_surface(s, SURF_COARSE_SIGMA_PX));
             model.lines = Some(fit_fixed_lines(map, &model));
             model.horizon = Some(fit_horizon(map, &model));
@@ -1883,8 +2527,15 @@ impl GlareModel {
             // the lens hood shadow live; at the centre the parametric model
             // already covers the halo, and this way dark Milky Way nebulae
             // are not flattened.
-            let t = ((r / self.r_full - SURF_R_START) / (SURF_R_END - SURF_R_START)).clamp(0.0, 1.0);
-            let wgt = t * t * (3.0 - 2.0 * t);
+            // A surface the session itself vouched for is subtracted
+            // everywhere and in full: the radial ramp and the mirror test
+            // below are what stands in for evidence when there is none.
+            let wgt = if self.surface_verified {
+                1.0
+            } else {
+                let t = ((r / self.r_full - SURF_R_START) / (SURF_R_END - SURF_R_START)).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
             if wgt > 0.0 {
                 let sv = sf.eval(x, y);
                 // Coarse component: only the part **shared with the
@@ -1895,7 +2546,9 @@ impl GlareModel {
                 // the smaller magnitude is taken if they share a sign;
                 // otherwise zero. A dark nebula on one side only is left
                 // untouched; a symmetric wedge is removed entirely.
-                let cv = match &self.surface_coarse {
+                let cv = if self.surface_verified {
+                    self.surface_coarse.as_ref().map(|c| c.eval(x, y)).unwrap_or([0.0; 3])
+                } else { match &self.surface_coarse {
                     Some(cs) => {
                         let a = cs.eval(x, y);
                         let b = cs.eval(2.0 * self.cx - x, y);
@@ -1910,7 +2563,7 @@ impl GlareModel {
                         k
                     }
                     None => [0.0; 3],
-                };
+                } };
                 let cfull = self.surface_coarse.as_ref().map(|c| c.eval(x, y)).unwrap_or([0.0; 3]);
                 for c in 0..3 {
                     // fine − coarse (fine structure) + mirror-shared coarse
@@ -1970,7 +2623,7 @@ impl GlareModel {
         format!(
             "optical centre ({:.0},{:.0}) [Δ={:+.0},{:+.0} px vs geom. centre]  \
              halo(G): peak−trough {:.2}% (r≤{:.0}px)  angular max {:.2}%  gradient(G): {:.2}%  \
-             residual surface(G): {:.2}%  row bands(G): {:.2}%  spokes(G): {:.2}%  horizon(G): {:.2}% towards {:.0}°  residual MAD R/G/B {:.3}/{:.3}/{:.3}%",
+             residual surface(G): {:.2}%{}  row bands(G): {:.2}%  spokes(G): {:.2}%  horizon(G): {:.2}% towards {:.0}°  residual MAD R/G/B {:.3}/{:.3}/{:.3}%",
             self.cx,
             self.cy,
             self.cx - self.width as f32 * 0.5,
@@ -1980,6 +2633,11 @@ impl GlareModel {
             100.0 * ang_max / ped,
             100.0 * (p_max - p_min) / ped,
             100.0 * self.surface.as_ref().map(|s| s.range[c]).unwrap_or(0.0) / ped,
+            if self.surface_verified {
+                format!(" [verified on both halves of the session, {:.0}% agreed, subtracted whole]", 100.0 * self.surface_agreement)
+            } else {
+                String::new()
+            },
             100.0 * self.lines.as_ref().map(|l| l.rows_range[c]).unwrap_or(0.0) / ped,
             100.0 * self.lines.as_ref().map(|l| l.spokes_range[c]).unwrap_or(0.0) / ped,
             100.0 * self.horizon.as_ref().map(|h| h.range[c]).unwrap_or(0.0) / ped,
@@ -2035,15 +2693,10 @@ pub fn clean_frame(model: &GlareModel, frame: &Frame, extra: Option<&FrameCorr>,
     // Sky level this frame's deficit is measured against: its own, so the
     // correction follows the night instead of being fixed at the level the
     // model was fitted at.
-    let flat_level = match (&model.flat, extra) {
-        (Some(_), Some(e)) => [
-            model.pedestal[0] * e.level_ratio,
-            model.pedestal[1] * e.level_ratio,
-            model.pedestal[2] * e.level_ratio,
-        ],
-        (Some(_), None) => model.pedestal,
-        (None, _) => [0.0; 3],
-    };
+    // The frame's sky against the session's: the deficit scales with it, and
+    // it is the very ratio `apply_map` used when the maps this model was
+    // fitted on were lifted.
+    let flat_ratio = extra.map_or(1.0, |e| e.level_ratio);
     let mut out = vec![0.0f32; frame.rgb.len()];
     let model_block_half = extra.map_or(0.0, |e| e.k_lp.step * 0.5);
     out.par_chunks_mut(w * 3)
@@ -2090,13 +2743,12 @@ pub fn clean_frame(model: &GlareModel, frame: &Frame, extra: Option<&FrameCorr>,
                 // put a bright dome on the early frames and a hole in the
                 // late ones is one of level, and subtracting the deficit
                 // removes it just as well while leaving the noise alone.
-                let fl = model.flat.as_ref().map(|f| f.eval(xf, yf));
+                let deficit = model
+                    .flat
+                    .as_ref()
+                    .map_or([0.0; 3], |f| f.deficit(f.eval(xf, yf), flat_ratio));
                 for c in 0..3 {
-                    let deficit = fl.map_or(0.0, |f| {
-                        (1.0 - f[c].clamp(FLAT_MIN_TRANSMISSION, 1.0 / FLAT_MIN_TRANSMISSION))
-                            * flat_level[c]
-                    });
-                    let mut v = src[x * 3 + c] * wb[c] + deficit - k[c];
+                    let mut v = src[x * 3 + c] * wb[c] + deficit[c] - k[c];
                     if cg[c] != 1.0 {
                         v = model.pedestal[c] + (v - model.pedestal[c]) * cg[c];
                     }
@@ -2524,6 +3176,36 @@ pub fn debug_dump_halves(
         let ty: f32 = sl.iter().map(|&i| transforms[i].ty).sum::<f32>() / n;
         let ang: f32 = sl.iter().map(|&i| transforms[i].angle_deg()).sum::<f32>() / n;
         writeln!(ht, "{name}: n={} tx_mean={tx:.1} ty_mean={ty:.1} ang_mean={ang:.3}", sl.len())?;
+    }
+    Ok(())
+}
+
+/// Diagnostic: how often each cell was covered over the session
+/// (`cover.csv`: gx,gy,landscape,cloud fraction) and the star signal the
+/// cloud test measured against (`star.csv`: gx,gy,session median,reference).
+pub fn debug_dump_masks(
+    maps: &[BgMap],
+    land: &CellMask,
+    clouds: &[CellMask],
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let (gw, gh) = (land.gw, land.gh);
+    let n = gw * gh;
+    let mut fc = std::io::BufWriter::new(std::fs::File::create(dir.join("cover.csv"))?);
+    for i in 0..n {
+        let cov = clouds.iter().filter(|m| m.data[i]).count() as f32 / clouds.len().max(1) as f32;
+        writeln!(fc, "{},{},{},{}", i % gw, i / gw, if land.data[i] { 1 } else { 0 }, cov)?;
+    }
+    let reference = star_reference(maps, land);
+    let mut fs = std::io::BufWriter::new(std::fs::File::create(dir.join("star.csv"))?);
+    for i in 0..n {
+        let mut v: Vec<f32> = maps.iter().filter(|m| !m.star.is_empty()).map(|m| m.star[i]).collect();
+        let med = if v.is_empty() { 0.0 } else { median_inplace(&mut v) };
+        let mut z: Vec<f32> = maps.iter().filter(|m| !m.noise.is_empty()).map(|m| m.noise[i]).collect();
+        let nz = if z.is_empty() { 0.0 } else { median_inplace(&mut z) };
+        writeln!(fs, "{},{},{},{},{}", i % gw, i / gw, med, reference[i], nz)?;
     }
     Ok(())
 }

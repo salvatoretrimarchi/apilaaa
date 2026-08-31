@@ -85,6 +85,28 @@ gradient are each modelled and removed, and what was underneath them survives.
 Every frame of the sequence gets the same treatment, which is what makes the
 exported timelapse hold still instead of pulsing.
 
+**A fixed tripod with weather in it.** 937 frames of 5 s at ISO 6400, Canon
+EOS 6D and an EF 50 mm f/1.4, from 01:55 to 03:49 under a light dome that
+covers half the frame — and with lit cloud crossing the sky for part of the
+night.
+
+![A 5 s frame with the light dome washing out the left of the sky, next to the same frame cleaned: flat sky, the same cloud still there](docs/img/fixed-frame.webp)
+
+Cloud is the hard case, and it is the reason the untracked path exists in the
+form it does. A cloud lit from below is smooth, lopsided and far brighter than
+the sky around it — the same description as a lens halo or a flare wedge — so
+anything that separates defect from sky by shape alone puts the cloud in the
+defect model and then subtracts it from every frame of the night, including the
+ones where that patch of sky was clear. Here it is separated by what is behind
+it instead: the stars come through stray light and do not come through cloud.
+The cloud stays in the frame, at its own brightness; the dome underneath it
+does not.
+
+Measured on the cells of that session no cloud ever touched, the background of
+the stack goes from **22.5 % peak-to-peak to 0.74 %** — and over the same
+pixels the star signal is unchanged to one part in a thousand, which is the
+other half of the claim: nothing was flattened away with it.
+
 ## Install
 
 Every release carries prebuilt archives, so `cargo` is only needed to build from
@@ -231,15 +253,25 @@ that depend on which signal is the stationary one.
 | Registration | Triangle matching over the detected stars, RANSAC, least-squares similarity — rotation *and* translation | Two-scale normalized cross-correlation of the high-passed luminance, restricted to the landscape cells; translation only, sub-pixel, capped at `--fixed-search` px |
 | Foreground mask | One per frame | A single consensus mask: a cell is landscape when more than half the frames see it as such |
 | Per-frame anomaly | `Full` | `--fixed-anomaly`, `coarse` by default, so the drifting Milky Way is not read as a defect |
+| Cloud | Not detected: with the sky fixed on the sensor there is no reference to measure a cell's stars against over time | Detected per frame from the collapse of the star signal, and kept out of every fit. A frame with cloud in it does not help determine the background at all |
+| Vignetting | Left to the additive model, rescaled per frame by the dome amplitude | Also measured as a multiplicative field from how each cell answers a change in the sky level, and constrained to a radial, outward non-increasing lens profile so the light dome cannot pose as it |
+| Residual surface | Subtracted only towards the edges, and only the part its own left/right mirror vouches for | Verified against the two halves of the session — the sky turned, the lens did not — and, where that verification is available, subtracted whole and everywhere |
 | `--stack-max-foreground` | Defaults to `0.0`: only clear-sky frames are averaged | Defaults to `1.0`: the landscape is part of the picture, never a reason to drop a frame |
 | The stack (`-o`) | A deep still — pinpoint stars, the landscape smeared by its own motion | A star-trail image — fixed landscape, the stars drawn as arcs |
 | `--export-clean` window | Combined on the stabilized frames directly: registration already put the sky in place | Warped onto the sky through the chain of star fits between consecutive frames, then combined |
 | Export levels and stretch | Taken from the stack | Taken from one representative frame (the sky level closest to the session median), because a trail stack has no star cores to match against; the run names the frame it picked |
 
-Everything else — the defect model, the frame selection by sky level, the
-deflickering, the transient rescue, the dawn ramp — is identical in both modes,
-which is why the flags in [Options](#options) apply to both unless the table
-says otherwise.
+Everything else — the frame selection by sky level, the deflickering, the
+transient rescue, the dawn ramp — is identical in both modes, which is why the
+flags in [Options](#options) apply to both unless the table says otherwise.
+
+The four rows above the fold are registration and framing; the three below it
+are the defect model, and they exist for one reason. A fixed tripod is the only
+case in which the sky *moves over* the camera, and that motion is evidence: it
+is what lets the tool ask whether a piece of structure belongs to the night or
+to the lens, and answer with a measurement instead of an assumption about
+shapes. Everything the untracked path does differently is a use of that
+evidence.
 
 ### Picking the wrong one
 
@@ -629,13 +661,20 @@ exporting 451 frames to res_clean (window 7 frames, stabilize=true, deflicker=tr
 exported 451 frames in 414.2s
 ```
 
-An untracked run replaces the star fit with the drift it measured, and names
-the frame it takes the export's levels from:
+An untracked run replaces the star fit with the drift it measured, reports what
+it found out about the weather and the lens, and names the frame it takes the
+export's levels from:
 
 ```
 tripod drift: measured against the reference's landscape (18.4% of the frame), up to 64 px
   [10/517] _DSC0010.ARW: 38 stars, drift (+1.43,-0.62) px, corr 0.81, sky 0.2908 in 1.61s
   [11/517] _DSC0011.ARW: 37 stars, drift not measurable, identity, sky 0.2911 in 1.58s
+landscape: single consensus mask over 937 frames, 3.4% of the frame
+cloud: 214 of 937 frames with more than 5% covered (median cover 0.9%, worst 35.5%) — those cells enter no fit
+background from 568 of 937 stacked frames (cloud ≤ 2%)
+flat field: no falloff measurable over this session (sky level spread ×1.16) — nothing added back
+sky motion between the halves of the session: 374 px at r=1672 px (51 min apart)
+glare/gradient [stack]: ... residual surface(G): 33.52% [verified on both halves of the session, 64% agreed, subtracted whole] ... residual MAD R/G/B 0.134/0.122/0.119%
 levels reference: _DSC0233.ARW (sky 0.2301, closest to the session median 0.2296) — the star-trail stack is not one
 ```
 
@@ -657,6 +696,23 @@ What to look at:
   frame is being ramped towards its natural version.
 - **`transients … px`** is how many pixels were rescued from the temporal
   combination — a meteor, a satellite, a plane.
+- **`cloud`** and **`background from`**, on an untracked run, are the weather
+  report. The median cover is what a typical frame had; `background from` is how
+  many frames were clear enough to help determine the background, and it is
+  normally most of them. If it collapses to two dozen the run says so out loud,
+  and the night was cloudy enough that the model is doing its best rather than
+  its job. `cloud: not measurable` means the session's stars do not clear its
+  noise well enough for the test to be worth running — nothing is excluded, and
+  nothing is guessed at.
+- **`flat field`** either reports the transmission it measured, from the centre
+  outwards, or says it was not measurable, which is a statement about the night
+  and not about the lens: separating the field needs the sky level to have
+  moved, and a short session at a steady level gives it no lever.
+- **`sky motion between the halves`** and **`verified on both halves`** are the
+  residual surface's evidence: how far the sky turned between the two halves of
+  the session, and how much of the surface both halves put in the same place.
+  Without enough motion the line does not appear and the surface falls back to
+  the conservative, symmetry-vouched form used on tracked sequences.
 - **`drift` and `corr`**, on an untracked run, are the equivalent of `θ`/`t`
   and `inliers`: the drift should stay small and evolve smoothly over the night
   — legs settling, wind — and the correlation should sit well clear of the
@@ -708,6 +764,42 @@ from the average is not rejection from the sequence, so most of the night that a
 stacker would throw away still becomes video. And a whole night of tracking
 drift costs only 8 % of the frame area, because the crop is computed as the
 largest rectangle every aligned frame actually covered rather than guessed at.
+
+### A fixed-tripod session, measured
+
+The untracked path is measured the same way, on 937 frames of 5 s at ISO 6400
+from a Canon EOS 6D under a light dome and intermittent cloud. Flatness is
+peak-to-peak (p99 − p1) of the background over 64 px blocks, as a percentage of
+the median; the star numbers are counted over the same pixels in both images.
+
+| What | Correction off | Correction on |
+|---|---|---|
+| Background, over cells no cloud ever touched | 22.5 % | **0.74 %** |
+| Background, whole frame (the cloud itself included) | 51.2 % | 12.6 % |
+| Quadrant medians, brightest over darkest | ×1.56 | ×1.07 |
+| Radial profile at the frame edge (centre = 1) | 0.74 | 1.005 |
+| Star pixels / star flux / noise | — | ×1.001 / ×1.001 / ×1.000 |
+
+The last two rows are the ones that matter together. The vignetting is gone —
+the edge of the frame no longer sits a quarter darker than its centre — and the
+stars over the same pixels are neither dimmer nor noisier for it, because
+everything the model subtracts is smooth and the sky's own structure is what the
+robust fits are built to reject.
+
+What the run says about itself on that session: cloud over a median of 0.9 % of
+each frame and up to 35.5 % of the worst, 568 of the 937 frames clear enough to
+help determine the background, a sky that turned 374 px between the two halves
+of the session — enough for the residual surface to be verified against them,
+which it was, with 64 % of it agreed — and a final model residual of 0.12 % of
+the sky level.
+
+The second untracked test session — a different camera, a different lens, no
+landscape in the framing at all and no measurable stars per block — improves
+from 17.8 % to 8.0 % against the previous release, and its cloud test correctly
+declines to run: a detector that cannot measure is worse than no detector,
+because the cells it invents leave the fits. Tracked output is unchanged to
+within the ±1 LSB the float summation order costs between two runs of the same
+binary.
 
 ## How it works
 
@@ -774,13 +866,65 @@ Rejection from the stack is not rejection from the export: excluded frames are
 still written by `--export-clean`, the only exception being frames whose sky is
 already saturated, where there is nothing left to clean.
 
+Under `--fixed-tripod` there is a second, stricter selection on top of this one,
+and it decides something else: which frames are allowed to determine the
+background. Cloud is what it turns on, and it is described in [The defect
+model](#4-the-defect-model).
+
 ### 4. The defect model
 
-The maps of the selected frames are combined into a temporal median that ignores
-each frame's foreground, so a tree occluding part of one frame does not bias the
-cell where other frames see sky. Cells that were occluded in nearly every frame
-are filled in from their neighbours and marked as having no real data, so they
-influence no fit.
+**Which frames are allowed to say what the background is.** On an untracked
+sequence, before any of this, every frame is asked whether it had cloud in it.
+The test is not brightness — a lit cloud and a lens halo are both smooth,
+lopsided and brighter than the sky, and no threshold on brightness separates
+them — but stars: a defect is stray light *added* to the sky and the stars come
+through it, while a cloud is opaque and there are none behind it. So each cell
+carries a count of the pixels that clear its own background by 4 MAD, and a cell
+whose count has collapsed to a third of what the sky shows at that radius, by a
+margin its own binomial spread cannot explain, while its background sits above
+the level that cell shows on its clearest nights, is cloud.
+
+Cloud cells enter no fit. Beyond that, a frame with more than 2 % of it covered
+is barred from determining the background at all — it is still stacked, still
+exported, still cleaned. The threshold is deliberately close to zero: for the
+export the question is *where* the cloud is, and a mask answers it; for the
+model the question is whether this frame is certainly clear, and a detector that
+is wrong about 2 % of the cells has already answered no. A night gives hundreds
+of frames and needs a couple of dozen, so doubt is cheap to act on — and a cloud
+that does get in is subtracted from every frame of the night, including all the
+ones where that patch of sky was clear.
+
+A session whose stars do not clear the noise well enough for the count to mean
+anything is not asked the question at all: the run says so, and no cell is
+excluded. Measured on the two untracked test sessions, the star signal differs
+by 4× between them, and the one below the bar abstains.
+
+**The multiplicative field.** Also untracked only. Vignetting attenuates
+whatever light reaches the sensor, so it scales with the sky rather than adding
+to it, and a model that subtracts a fixed amount is only right at the level it
+was fitted at. What makes it measurable is that the sky level moves over a night
+while the lens does not, so each cell is regressed against its frame's sky level
+and the slope is the transmission.
+
+That regression cannot, on its own, tell the lens from the light-pollution dome:
+on a fixed tripod the dome is stationary on the sensor exactly like the
+vignetting, and it grows and fades with the very level the slope is measured
+against. Shape is what separates them. A dome is a gradient across the frame; a
+lens is a bowl about its axis, and it never transmits more towards the edge than
+on the axis. So the measured field is projected onto that description before it
+is used at all — a robust plane is fitted and its *tilt* removed, what is left
+is collapsed onto a radial profile by azimuthal median, and the profile is
+forced to be non-increasing outwards and normalised on the axis. The deficit it
+implies is added back at one reference level, shared by the maps the model is
+fitted on and the pixels it is subtracted from; if the session's sky level never
+moved enough to measure the field at all, the run says so and nothing is divided
+out.
+
+**The median map.** The maps of the selected frames are then combined into a
+temporal median that ignores each frame's foreground and cloud, so a tree
+occluding part of one frame does not bias the cell where other frames see sky.
+Cells that were occluded in nearly every frame are filled in from their
+neighbours and marked as having no real data, so they influence no fit.
 
 That median map is then decomposed in four successive stages, each one operating
 on the residual left by the previous:
@@ -801,6 +945,19 @@ on the residual left by the previous:
    about the optical axis. System defects are symmetric; the sky is not. The
    surface is ramped in between `0.5·r_full` and `0.9·r_full`, so the centre is
    left to the parametric model alone.
+
+   On an untracked sequence that caution is replaced by evidence. The session is
+   split down the middle in time, a median map and a surface are built for each
+   half, and only what both halves found in the *same sensor cells* is kept:
+   same sign, smaller magnitude. Between the two halves the sky turned and the
+   lens did not, so structure that stayed put is background whatever shape it
+   has, and structure that moved is sky however symmetric it looks. What
+   survives that test is subtracted whole and over the whole frame, mirror rule
+   and radial ramp dropped, because they were standing in for a measurement that
+   is now available. The test itself is only run when the sky moved far enough
+   to make it meaningful — at least twice the surface's own coarse scale at half
+   the frame's radius — and the run prints the motion it measured and the
+   fraction of the surface the two halves agreed on.
 3. **Fixed 1D patterns.** Two patterns whose geometry belongs to the hardware
    rather than to the sky: sensor row banding (a per-row median, high-passed in
    `y`) and flare spokes (a per-angle median around the optical centre,
@@ -985,7 +1142,7 @@ Three environment variables expose the internals without changing the output:
 | Variable | Effect |
 |---|---|
 | `APILAAA_DEBUG` | Prints the per-channel radial profiles and lists every frame excluded from the stack with its sky level and foreground fraction. |
-| `APILAAA_DEBUG_DIR=<dir>` | Dumps the measured background map and the evaluated model as CSV, the temporal medians of each chronological half with their mean transforms, and the transient masks as downsampled PGM. |
+| `APILAAA_DEBUG_DIR=<dir>` | Dumps the measured background map and the evaluated model as CSV, the temporal medians of each chronological half with their mean transforms, the transient masks as downsampled PGM and — on an untracked run — `cover.csv` (per cell: landscape flag and the fraction of frames the cloud test found it covered in) and `star.csv` (per cell: the session's star signal, the reference it was tested against, and the noise both were measured over). |
 | `APILAAA_DEBUG_CORR` | Prints, per frame, coarse numeric maps of the anomaly, the model correction, the fitted surface and the resulting residual, as a percentage of the sky level. |
 
 The two halves dumped by `APILAAA_DEBUG_DIR` are worth knowing about: if the
@@ -1053,6 +1210,22 @@ export cost at the price of the noise reduction.
   against; below 2 % landscape it declines to estimate the drift and leaves
   every frame at identity — which for a tripod that genuinely did not move is
   the right answer anyway.
+- **The cloud test needs stars it can count.** It reads how many pixels of a
+  block clear its own background by 4 MAD, so a session whose stars barely
+  clear its noise — a short lens, a low ISO, a bright enough sky — cannot be
+  asked where its clouds are. The run says so and excludes nothing, which is the
+  safe way to be unable to answer: a mistaken cloud is cells taken out of the
+  fits for no reason.
+- **The multiplicative field needs a night that changes.** Separating the lens'
+  transmission from what is added to the frame rests on the sky level moving
+  over the session, so a short run at a steady level leaves it unmeasurable —
+  reported as such, with nothing added back. The vignetting is then handled
+  additively by the model, as it is on a tracked sequence.
+- **The residual surface is only verified when the sky has moved.** The
+  two-halves test needs the sky to have turned by at least twice the surface's
+  coarse scale between the halves — around a quarter of an hour at 50 mm. Below
+  that the surface falls back to the conservative form: edges only, and only
+  where its own mirror image vouches for it.
 - **The export window of an untracked sequence rests on a similarity.** The
   sky's apparent motion is a rotation on the celestial sphere; a similarity only
   approximates it, and the wider the field or the longer the interval, the worse
