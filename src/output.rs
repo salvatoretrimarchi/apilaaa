@@ -1,3 +1,4 @@
+use crate::raw::CameraProfile;
 use crate::say;
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
@@ -89,24 +90,21 @@ pub fn analyze_stretch(rgb: &[f32]) -> StretchParams {
     }
 }
 
-/// XYZ→camera matrix (D65) ×10000, row-major 3x3. Official LibRaw/dcraw
-/// values. The generic fallback is the identity, which produces flat but
+/// The camera's XYZ→camera matrix (D65) as the nine SRATIONALs the DNG
+/// `ColorMatrix1` tag takes, in dcraw's ×10000 fixed point.
+///
+/// The values come from the body the frames were read from — `rawloader`
+/// carries the official LibRaw/dcraw matrix of every camera it decodes — so
+/// this is a unit conversion and nothing else. `raw::load` substitutes the
+/// identity when a file offers no matrix at all, which produces flat but
 /// valid colours.
-fn color_matrix1(camera_model: &str) -> [(i32, i32); 9] {
+fn color_matrix1(xyz_to_cam: [[f32; 3]; 3]) -> Vec<SRational> {
     let d = 10000;
-    let raw: [i32; 9] = match camera_model {
-        "SONY ILCE-7M3" => [7374, -2389, -551, -5435, 13162, 2519, -1006, 1795, 6552],
-        "SONY ILCE-7M4" => [7460, -2365, -588, -5687, 13442, 2474, -624, 1156, 6584],
-        "SONY ILCE-7RM3" | "SONY ILCE-7RM3A" => [6640, -1847, -503, -5238, 13010, 2474, -993, 1859, 6861],
-        "SONY ILCE-7RM4" | "SONY ILCE-7RM4A" => [7662, -2686, -660, -5361, 13391, 2221, -1150, 1826, 7494],
-        "SONY ILCE-6400" => [7657, -2847, -607, -4083, 11966, 2389, -684, 1418, 5844],
-        _ => [10000, 0, 0, 0, 10000, 0, 0, 0, 10000],
-    };
-    [
-        (raw[0], d), (raw[1], d), (raw[2], d),
-        (raw[3], d), (raw[4], d), (raw[5], d),
-        (raw[6], d), (raw[7], d), (raw[8], d),
-    ]
+    xyz_to_cam
+        .iter()
+        .flatten()
+        .map(|v| SRational { n: (v * d as f32).round() as i32, d })
+        .collect()
 }
 
 /// Writes a linear RGB 16-bit DNG in [0, 65535] (black=0, white=65535)
@@ -131,10 +129,10 @@ pub fn write_dng(
     rgb: &[f32],
     w: usize,
     h: usize,
-    camera_model: &str,
+    camera: &CameraProfile,
     stretch: Option<StretchParams>,
 ) -> Result<()> {
-    write_dng_impl(path, rgb, w, h, camera_model, stretch, true)
+    write_dng_impl(path, rgb, w, h, camera, stretch, true)
 }
 
 /// Same as `write_dng` but without printing the stretch parameters (for
@@ -144,10 +142,10 @@ pub fn write_dng_quiet(
     rgb: &[f32],
     w: usize,
     h: usize,
-    camera_model: &str,
+    camera: &CameraProfile,
     stretch: Option<StretchParams>,
 ) -> Result<()> {
-    write_dng_impl(path, rgb, w, h, camera_model, stretch, false)
+    write_dng_impl(path, rgb, w, h, camera, stretch, false)
 }
 
 fn write_dng_impl(
@@ -155,7 +153,7 @@ fn write_dng_impl(
     rgb: &[f32],
     w: usize,
     h: usize,
-    camera_model: &str,
+    camera: &CameraProfile,
     stretch: Option<StretchParams>,
     verbose: bool,
 ) -> Result<()> {
@@ -206,7 +204,7 @@ fn write_dng_impl(
     // --- Mandatory DNG tags ---
     de.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;   // DNGVersion 1.4.0.0
     de.write_tag(Tag::Unknown(50707), &[1u8, 4, 0, 0][..])?;   // DNGBackwardVersion 1.4.0.0
-    de.write_tag(Tag::Unknown(50708), camera_model)?;          // UniqueCameraModel
+    de.write_tag(Tag::Unknown(50708), camera.model.as_str())?; // UniqueCameraModel
 
     // --- Sensor levels (after processing) ---
     // BlackLevelRepeatDim LONG[2] = [1, 1] (one value per plane)
@@ -232,8 +230,7 @@ fn write_dng_impl(
     // CalibrationIlluminant1 = 21 (D65)
     de.write_tag(Tag::Unknown(50778), 21u16)?;
     // ColorMatrix1 SRATIONAL[9] — XYZ (D65) → native camera
-    let m = color_matrix1(camera_model);
-    let color_matrix: Vec<SRational> = m.iter().map(|&(n, d)| SRational { n, d }).collect();
+    let color_matrix = color_matrix1(camera.xyz_to_cam);
     de.write_tag(Tag::Unknown(50721), &color_matrix[..])?;
     // AnalogBalance RATIONAL[3] = [1, 1, 1]
     de.write_tag(
@@ -262,15 +259,15 @@ fn write_dng_impl(
     Ok(())
 }
 
-/// Copies EXIF + MakerNotes + XMP + ICC from the source ARW to the
+/// Copies EXIF + MakerNotes + XMP + ICC from the source RAW file to the
 /// destination DNG using exiftool, excluding the structural and DNG tags we
 /// have just written.
-pub fn copy_metadata(source_arw: &Path, dest_dng: &Path) -> Result<()> {
+pub fn copy_metadata(source_raw: &Path, dest_dng: &Path) -> Result<()> {
     let out = Command::new("exiftool")
         .args([
             "-TagsFromFile",
         ])
-        .arg(source_arw)
+        .arg(source_raw)
         .args([
             "-EXIF:all",
             "-MakerNotes:all",

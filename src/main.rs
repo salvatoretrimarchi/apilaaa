@@ -24,7 +24,8 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(version, about = "RAW stacker with translation and rotation correction")]
 pub struct Args {
-    /// Directory holding the input RAW files (.ARW)
+    /// Directory holding the input RAW files (any Bayer format rawloader
+    /// reads: .ARW, .CR2, .NEF, .ORF, .RW2, .DNG …)
     #[arg(short, long, default_value = "res")]
     pub input: PathBuf,
 
@@ -265,12 +266,16 @@ fn run(args: Args) -> Result<()> {
             return Err(anyhow!("--no-stack requires --fixed-tripod: on a tracked sequence the stack is the reference every exported frame is levelled against"));
         }
     }
-    let mut paths = list_arw(&args.input)?;
+    let mut paths = list_raw(&args.input)?;
     if let Some(n) = args.limit {
         paths.truncate(n);
     }
     if paths.is_empty() {
-        return Err(anyhow!("no ARW found in {}", args.input.display()));
+        return Err(anyhow!(
+            "no RAW file found in {} (accepted extensions: {})",
+            args.input.display(),
+            raw::RAW_EXTENSIONS.join(", ")
+        ));
     }
     say!("found {} frames", paths.len());
     ui::head("frames", paths.len().to_string());
@@ -304,7 +309,7 @@ fn run(args: Args) -> Result<()> {
         say!("  WARNING: too few stars for the sky-aligned temporal window; --export-window will fall back to 1");
     }
 
-    let camera_model = ref_frame.camera.clone();
+    let camera = ref_frame.camera.clone();
     let w_ref = ref_frame.width;
     let h_ref = ref_frame.height;
     let flatten_on = !args.no_flatten;
@@ -1026,7 +1031,7 @@ fn run(args: Args) -> Result<()> {
     if args.no_stack {
         say!("no stack written (--no-stack); crop {}×{}", out_w, out_h);
     } else {
-        output::write_dng(&args.output, &out, out_w, out_h, &camera_model, stretch)?;
+        output::write_dng(&args.output, &out, out_w, out_h, &camera, stretch)?;
         say!("DNG written: {}", args.output.display());
     }
 
@@ -1055,7 +1060,7 @@ fn run(args: Args) -> Result<()> {
             (Some(grid), Some((_, m))) => {
                 let (x0, y0, _, _) = acc.valid_bounds();
                 let layer = flatten::correction_layer(grid, m.pedestal, x0, y0, out_w, out_h);
-                output::write_dng_quiet(path, &layer, out_w, out_h, &camera_model, stretch)?;
+                output::write_dng_quiet(path, &layer, out_w, out_h, &camera, stretch)?;
                 if let Some(e) = &src_exif {
                     exif::embed(path, e)?;
                 }
@@ -1140,7 +1145,7 @@ fn run(args: Args) -> Result<()> {
             stabilize,
             deflicker: !args.export_no_deflicker,
             keep_transients: !args.export_no_transients,
-            camera_model: &camera_model,
+            camera: &camera,
             stretch: export_stretch,
             n_workers,
             scatter_comp: args.scatter_comp,
@@ -1343,17 +1348,12 @@ fn compute_pipeline_params(
     )
 }
 
-fn list_arw(dir: &Path) -> Result<Vec<PathBuf>> {
+fn list_raw(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("listing {}", dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("ARW"))
-                .unwrap_or(false)
-        })
+        .filter(|p| raw::is_raw_file(p))
         .collect();
     v.sort();
     Ok(v)
