@@ -1002,12 +1002,30 @@ the borders left ragged by tracking drift.
 ### 6. Output
 
 The stack is analysed per channel to derive a linear stretch: white at the 99.9th
-percentile, black at `median − 3·MAD`. Computing both ends per channel is
+percentile of each channel, and black placed so that **the background lands at
+the same height in the output range in all three**. Both ends per channel is
 deliberate — a global white point would compress the dominant channel against a
-foreign one and introduce a tint. Those points are baked directly into the 16-bit
-data rather than delegated to the developer, so the clipping is visible even in
-raw processors that ignore `BlackLevel` on LinearRaw DNGs. `--no-stretch` keeps
-the sensor-native scale instead.
+foreign one and introduce a tint — but per channel is not enough on its own. The
+pipeline preserves the pedestal on purpose, and the pedestal carries the colour
+of whatever light the sky was under, which a camera's daylight white balance
+does not neutralise: fitting each black point to its own channel left that
+colour in the file, and in the black points, where no curve in a raw developer
+can reach it. Measured on the Canon test session, the background came out at
+7.6 % of the range in red, 4.9 % in green and 10.2 % in blue.
+
+So one margin is shared by the three: `black_c = median_c − s·(white_c −
+median_c)`, with `s` the largest any channel needs to keep its own 3·MAD of
+skirt below its background. No channel is clipped more tightly than it would
+have been alone, the other two simply keep more of their foot, and the run
+reports where the background landed — the same number three times. What the
+developer opens is a file whose channels are already aligned, with the stars
+keeping the colour they had relative to the sky.
+
+Those points are baked directly into the 16-bit data rather than delegated to
+the developer, so the clipping is visible even in raw processors that ignore
+`BlackLevel` on LinearRaw DNGs. `--no-stretch` keeps the sensor-native scale
+instead, aligned by nothing, which is what you want if the developer is where
+you would rather do all of it.
 
 The file is written as a linear RGB DNG (`PhotometricInterpretation = LinearRaw`,
 DNG 1.4.0.0) with the demosaic step already done, `WhiteLevel = 65535`,
