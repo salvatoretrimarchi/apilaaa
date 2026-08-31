@@ -33,7 +33,7 @@ use crate::exif;
 use crate::fixed;
 use crate::flatten::{self, CellMask};
 use crate::output::{self, StretchParams};
-use crate::raw;
+use crate::raw::{self, CameraProfile};
 use crate::FrameInfo;
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
@@ -848,7 +848,7 @@ pub struct ExportOpts<'a> {
     pub stabilize: bool,
     pub deflicker: bool,
     pub keep_transients: bool,
-    pub camera_model: &'a str,
+    pub camera: &'a CameraProfile,
     pub stretch: Option<StretchParams>,
     pub n_workers: usize,
     /// Contrast compensation β (see `flatten::clean_frame`).
@@ -1123,7 +1123,7 @@ pub fn export_sequence(
         let idx = order[next_emit];
         let stem = paths[idx].file_stem().unwrap().to_string_lossy();
         let out = opts.dir.join(format!("{stem}_clean.dng"));
-        output::write_dng_quiet(&out, &img, ow, oh, opts.camera_model, opts.stretch)?;
+        output::write_dng_quiet(&out, &img, ow, oh, opts.camera, opts.stretch)?;
         // Each exported frame carries its **own** source frame's metadata,
         // not the reference's: the capture time is what turns the sequence
         // back into a timelapse in the developer.

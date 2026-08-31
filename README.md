@@ -11,7 +11,7 @@ night of frames yields both a deep still and a finished sequence.
 
 | | |
 |---|---|
-| **Input** | A directory of Sony `.ARW` frames (one night, tracked or on a fixed tripod) |
+| **Input** | A directory of RAW frames — Sony `.ARW`, Canon `.CR2`, Nikon `.NEF`, Olympus `.ORF`, Panasonic `.RW2`, `.DNG` and the rest `rawloader` reads (one night, tracked or on a fixed tripod) |
 | **Output** | A linear RGB DNG stack, an optional cleaned DNG sequence, an optional "what was removed" layer |
 | **Interface** | Flags, or — started with no arguments — a setup screen and a live dashboard |
 | **Language** | Rust 2024, no GPU, parallel over frames with Rayon |
@@ -140,7 +140,7 @@ processes every frame twice.
 
 ## Quick start
 
-Point the tool at a directory of Sony `.ARW` files and give it an output path:
+Point the tool at a directory of RAW files and give it an output path:
 
 ```sh
 ./target/release/apilaaa --input res --output stacked.dng
@@ -172,7 +172,7 @@ running the defaults:
 Every option the command line takes is on it, grouped, and the ones that do not
 apply are left out: the tripod settings only exist once the sequence is marked
 untracked, the timelapse settings only once the export is switched on. The
-frames directory is counted as it is typed, so a path with no `.ARW` in it shows
+frames directory is counted as it is typed, so a path with no RAW file in it shows
 up before the run rather than after it, and the equivalent command line is
 written out at the bottom as the form is edited — the screen is a way of finding
 the flags, not a replacement for them.
@@ -443,7 +443,7 @@ entirely — and with it `--export-clean`, which refuses to run without a model.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `-i, --input <DIR>` | `res` | Directory holding the input `.ARW` files. |
+| `-i, --input <DIR>` | `res` | Directory holding the input RAW files. |
 | `-o, --output <DNG>` | `stacked.dng` | Output DNG for the stack. |
 | `--max-stars <N>` | `40` | Stars used per frame for alignment. |
 | `--limit <N>` | — | Process at most N frames; useful for quick tests. |
@@ -1035,10 +1035,12 @@ export cost at the price of the noise reduction.
 
 ## Limits
 
-- **Sony `.ARW` only.** The input listing accepts the `.ARW` extension and
-  nothing else. Decoding goes through `rawloader`, which reads far more formats,
-  so widening the filter is a one-line change — but the colour matrices are
-  written for Sony bodies and another brand would stack with an identity matrix.
+- **Bayer sensors only.** Decoding goes through `rawloader`, so any body it
+  knows is read — Sony, Canon, Nikon, Fuji, Olympus, Panasonic, Pentax, and a
+  source `.DNG` — and the DNG is written with that body's own colour matrix,
+  taken from the same table. What the pipeline cannot do is demosaic anything
+  that is not a `RGGB`/`BGGR`/`GRBG`/`GBRG` mosaic: a Foveon `.X3F` or an
+  X-Trans `.RAF` is decoded and then refused by name.
 - **One night per run.** The defect model is fitted on the session's own median,
   so mixing sessions — or lenses, or focal lengths — breaks the assumption that
   the defects are stationary.

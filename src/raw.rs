@@ -2,12 +2,47 @@ use anyhow::{anyhow, Context, Result};
 use rawloader::{CFA, RawImageData};
 use std::path::Path;
 
+/// The file extensions the input listing accepts.
+///
+/// Which decoder actually reads a file is decided by its content —
+/// `rawloader` sniffs the header and picks the decoder from the make it
+/// finds — so this list is not what makes a format work. It only keeps the
+/// sidecars, the JPEGs and everything else that shares the directory out of
+/// the run. Every entry here has a decoder behind it; a body that
+/// `rawloader` does not know fails on its own file with the make and model
+/// it read.
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "cr2", "crw", "dcr", "dcs", "dng", "erf", "fff",
+    "iiq", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf",
+    "raw", "rw2", "rwl", "sr2", "srf", "srw", "x3f",
+];
+
+/// True when `path` carries one of `RAW_EXTENSIONS`, whatever its case.
+pub fn is_raw_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| RAW_EXTENSIONS.iter().any(|k| ext.eq_ignore_ascii_case(k)))
+        .unwrap_or(false)
+}
+
+/// What the output DNG needs to say about the body the frames came from:
+/// the model string and the colour matrix that belongs to it.
+#[derive(Clone, Debug)]
+pub struct CameraProfile {
+    /// Make and model as read from the file, e.g. `Canon EOS 6D`.
+    pub model: String,
+    /// XYZ (D65) → native camera RGB, the DNG `ColorMatrix1` convention.
+    /// Taken from the camera `rawloader` identified, so every body it
+    /// decodes gets its own matrix rather than a fallback.
+    pub xyz_to_cam: [[f32; 3]; 3],
+}
+
 pub struct Frame {
     pub width: usize,
     pub height: usize,
     pub rgb: Vec<f32>,
     pub wb: [f32; 3],
-    pub camera: String,
+    pub camera: CameraProfile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +127,38 @@ pub fn load(path: &Path) -> Result<Frame> {
         raw.wb_coeffs[2] / raw.wb_coeffs[1].max(1.0),
     ];
 
-    let camera = format!("{} {}", raw.make.trim(), raw.model.trim());
+    let camera = CameraProfile {
+        model: format!("{} {}", raw.make.trim(), raw.model.trim()),
+        xyz_to_cam: xyz_to_cam(raw.xyz_to_cam),
+    };
 
     Ok(Frame { width: w, height: h, rgb, wb, camera })
+}
+
+/// Takes the three RGB rows of `rawloader`'s XYZ→camera matrix and puts them
+/// on the scale the DNG tag is written in (a plain float, 1.0 = unity).
+///
+/// The fourth row is the E channel of an RGBE sensor and has no place in a
+/// three-plane DNG. The scale has to be worked out rather than assumed: a
+/// camera out of `rawloader`'s own table carries dcraw's ×10000 fixed point
+/// (`7034, -804, …`), whereas a source DNG hands over the floats its
+/// `ColorMatrix` tag holds (`0.7034, -0.0804, …`), and both reach here
+/// through the same field.
+fn xyz_to_cam(m: [[f32; 3]; 4]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    let biggest = m[..3].iter().flatten().fold(0.0f32, |a, v| a.max(v.abs()));
+    if biggest == 0.0 {
+        // No matrix at all: the identity leaves the data alone and lets the
+        // developer treat it as camera-native rather than inventing colour.
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let scale = if biggest > 10.0 { 1.0 / 10000.0 } else { 1.0 };
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[i][j] * scale;
+        }
+    }
+    out
 }
 
 fn demosaic_bilinear(bayer: &[f32], w: usize, h: usize, cfa: Cfa) -> Vec<f32> {

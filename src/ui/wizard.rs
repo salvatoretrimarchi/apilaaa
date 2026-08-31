@@ -324,7 +324,7 @@ fn label(id: Id) -> &'static str {
 fn help(id: Id) -> &'static str {
     use Id::*;
     match id {
-        Input => "Directory holding the .ARW files. They are taken in name order, which for a camera is capture order.",
+        Input => "Directory holding the RAW files — .ARW, .CR2, .NEF, .ORF, .RW2, .DNG and the rest rawloader reads. They are taken in name order, which for a camera is capture order.",
         Sequence => "Tracked: an equatorial mount held the stars still, so the frames are aligned on the stars. Untracked: the camera sat on a fixed tripod, the landscape is what stays still and the stack comes out as star trails.",
         Limit => "Process only the first N frames. 0 uses the whole directory. A few frames are enough to see whether the settings are right before committing to the session.",
         Stack => "Off skips loading, cleaning and averaging entirely: only the crop is worked out, for the timelapse export. Needs the export on, and an untracked sequence.",
@@ -413,7 +413,7 @@ struct Form {
     /// The focused field's text while it is being typed into. Committed on
     /// Enter, on leaving the field, and before starting the run.
     edit: Option<String>,
-    /// Cached count of .ARW files in `cfg.input`, and what it was counted
+    /// Cached count of RAW files in `cfg.input`, and what it was counted
     /// for.
     scan: (String, std::result::Result<usize, String>),
     /// Why the run cannot start yet, shown under the command line.
@@ -423,7 +423,7 @@ struct Form {
 impl Form {
     fn new() -> Self {
         let cfg = Cfg::new();
-        let scan = (cfg.input.clone(), count_arw(Path::new(&cfg.input)));
+        let scan = (cfg.input.clone(), count_raw(Path::new(&cfg.input)));
         let mut f = Form { cfg, cursor: 0, top: 0, edit: None, scan, error: None };
         f.cursor = f.next_field(0, 1).unwrap_or(0);
         f
@@ -569,7 +569,7 @@ impl Form {
 
     fn rescan(&mut self) {
         if self.scan.0 != self.cfg.input {
-            self.scan = (self.cfg.input.clone(), count_arw(Path::new(&self.cfg.input)));
+            self.scan = (self.cfg.input.clone(), count_raw(Path::new(&self.cfg.input)));
         }
     }
 
@@ -654,7 +654,7 @@ impl Form {
         }
         match &self.scan.1 {
             Err(e) => return Some(e.clone()),
-            Ok(0) => return Some(format!("no .ARW found in {}", c.input.trim())),
+            Ok(0) => return Some(format!("no RAW file found in {}", c.input.trim())),
             Ok(_) => {}
         }
         if !c.stack && !c.export {
@@ -712,7 +712,7 @@ impl Form {
 
     fn draw_body(&mut self, f: &mut Frame, area: Rect) {
         let frames = match &self.scan.1 {
-            Ok(0) => Span::styled("  no .ARW here", Style::default().fg(Color::Red)),
+            Ok(0) => Span::styled("  no RAW here", Style::default().fg(Color::Red)),
             Ok(n) => Span::styled(format!("  {n} frames"), Style::default().fg(Color::Green)),
             Err(_) => Span::styled("  not a readable directory", Style::default().fg(Color::Red)),
         };
@@ -901,19 +901,13 @@ fn value(cfg: &Cfg, id: Id, scan: &(String, std::result::Result<usize, String>))
 
 /// Counts the frames the run would pick up, with the same extension rule
 /// the pipeline uses.
-fn count_arw(dir: &Path) -> std::result::Result<usize, String> {
+fn count_raw(dir: &Path) -> std::result::Result<usize, String> {
     if dir.as_os_str().is_empty() {
         return Err("no frames directory given".into());
     }
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(rd
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("ARW"))
-                .unwrap_or(false)
-        })
+        .filter(|e| crate::raw::is_raw_file(&e.path()))
         .count())
 }
